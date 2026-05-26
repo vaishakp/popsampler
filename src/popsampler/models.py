@@ -108,12 +108,15 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
     secondary-mass low-mass smoothing factor. This is the critical improvement
     over independent 1D marginal sampling.
 
-    The spin implementation is an explicit named-parameter scaffold for the
-    Gaussian-component spin family: spin magnitudes are drawn from a beta
-    distribution on ``[0, amax]`` mixed with a truncated normal component, and
-    cos-tilts are drawn from an isotropic component mixed with a truncated normal
-    component. Validate the resulting 1D projections against the released
-    ``rates_on_grids`` products before science use.
+    The spin implementation is intentionally conservative. Some popsummary rows
+    expose ``alpha_chi``/``beta_chi`` values that are not positive. Those appear
+    to be derived beta-shape parameters from the mean/width parameterization,
+    not always valid independent sampled parameters. When the beta-shape pair is
+    valid, the code uses a beta-plus-truncated-normal spin-magnitude mixture; if
+    not, it falls back to the named truncated-normal ``mu_chi``/``sigma_chi``
+    component and records this in ``spin_magnitude_sampler_mode``. The released
+    ``a_1``/``a_2`` grids are the validation target for choosing the final spin
+    convention.
     """
 
     name = "BBHMassSpinRedshift_BrokenPowerLawTwoPeaks_GaussianComponentSpins_PowerLawRedshift"
@@ -168,8 +171,6 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
             raise ModelValidationError(f"Expected 0 < mlow_2 < mmax, got {mlow_2}, {mmax}")
         if _required(row, "sigpp_1") <= 0 or _required(row, "sigpp_2") <= 0:
             raise ModelValidationError("Gaussian peak widths sigpp_1/sigpp_2 must be positive")
-        if _required(row, "alpha_chi") <= 0 or _required(row, "beta_chi") <= 0:
-            raise ModelValidationError("Beta spin-magnitude parameters alpha_chi/beta_chi must be positive")
         if _required(row, "sigma_chi") <= 0 or _required(row, "sigma_spin") <= 0:
             raise ModelValidationError("Gaussian spin parameters sigma_chi/sigma_spin must be positive")
         amax = _required(row, "amax")
@@ -357,6 +358,7 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
 
         a1 = self._sample_spin_magnitude(row, n, rng)
         a2 = self._sample_spin_magnitude(row, n, rng)
+        spin_mode = self._spin_magnitude_sampler_mode(row)
 
         cos1 = self._sample_cos_tilt(row, n, rng, xi=xi)
         cos2 = self._sample_cos_tilt(row, n, rng, xi=xi)
@@ -376,6 +378,7 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
             "tilt_2": np.arccos(cos2),
             "phi_12": rng.uniform(0.0, 2.0 * np.pi, size=n),
             "phi_jl": rng.uniform(0.0, 2.0 * np.pi, size=n),
+            "spin_magnitude_sampler_mode": np.full(n, spin_mode, dtype=object),
         }
 
     def _sample_spin_magnitude(
@@ -384,19 +387,40 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
         n: int,
         rng: np.random.Generator,
     ) -> np.ndarray:
+        a_grid, pdf = self._spin_magnitude_pdf(row)
+        return InverseCDFSampler.from_pdf(a_grid, pdf).sample(n, rng)
+
+    def _spin_magnitude_sampler_mode(self, row: Mapping[str, float]) -> str:
+        if self._has_valid_beta_spin_shapes(row):
+            return "beta_plus_truncated_normal"
+        return "truncated_normal_only_invalid_beta_shapes"
+
+    def _spin_magnitude_pdf(self, row: Mapping[str, float]) -> tuple[np.ndarray, np.ndarray]:
         amax = _required(row, "amax")
         a_grid = np.linspace(0.0, amax, self.config.spin_grid_size)
-        beta_pdf = self._beta_spin_pdf(a_grid, row)
-        gaussian_pdf = self._normal_pdf(a_grid, _required(row, "mu_chi"), _required(row, "sigma_chi"))
+        gaussian_pdf = self._normal_pdf(
+            a_grid,
+            _required(row, "mu_chi"),
+            _required(row, "sigma_chi"),
+        )
         gaussian_pdf = np.where((a_grid >= 0.0) & (a_grid <= amax), gaussian_pdf, 0.0)
-        beta_pdf = _trapz_normalize(a_grid, beta_pdf, label="spin beta component")
-        gaussian_pdf = _trapz_normalize(a_grid, gaussian_pdf, label="spin Gaussian component")
+        gaussian_pdf = _trapz_normalize(a_grid, gaussian_pdf, label="spin truncated-normal component")
 
-        # Use xi_spin as the Gaussian-component weight for the spin family. This
-        # convention is validated empirically against released a_1/a_2 grids.
+        if not self._has_valid_beta_spin_shapes(row):
+            return a_grid, gaussian_pdf
+
+        beta_pdf = self._beta_spin_pdf(a_grid, row)
+        beta_pdf = _trapz_normalize(a_grid, beta_pdf, label="spin beta component")
+        # This mixture convention is explicitly empirical until validated against
+        # the released a_1/a_2 grids.
         xi = np.clip(_required(row, "xi_spin"), 0.0, 1.0)
         pdf = (1.0 - xi) * beta_pdf + xi * gaussian_pdf
-        return InverseCDFSampler.from_pdf(a_grid, pdf).sample(n, rng)
+        return a_grid, pdf
+
+    def _has_valid_beta_spin_shapes(self, row: Mapping[str, float]) -> bool:
+        alpha_chi = _required(row, "alpha_chi")
+        beta_chi = _required(row, "beta_chi")
+        return alpha_chi > 0.0 and beta_chi > 0.0
 
     def _beta_spin_pdf(self, a: np.ndarray, row: Mapping[str, float]) -> np.ndarray:
         alpha_chi = _required(row, "alpha_chi")
