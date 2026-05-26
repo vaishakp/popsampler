@@ -216,3 +216,31 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Downloaded GWTC / Zenodo data products
+data/
+*.part
+
+# Local figure-script downloads / extraction
+figure_scripts.tar
+figure_scripts/
+figure_scripts_search_hits.txt
+download_fig_scripts.sh
+
+# Validation outputs
+validation_outputs/
+validation_grid_marginal_samples.parquet
+validation_inspect.txt
+
+# Runner/local scratch directories
+runner_h5_work/
+runner_h5_report/
+figure_scripts_work/
+figure_scripts_report/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
