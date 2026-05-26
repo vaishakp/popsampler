@@ -1,11 +1,18 @@
 #!/usr/bin/env python
-"""Step 08: compare the named joint sampler's 1D projections to released grids.
+"""Step 08: validate the named joint sampler against released 1D grids.
 
-This is the first validation gate for the covariance-preserving sampler. The
-sampler draws a fixed number of events from each selected hyperposterior row, so
-its default validation target is the equal-row average of per-row normalized
-released grids. A rate-weighted target is also available for workflows where the
-number of events per hyper-row is proportional to the row's total rate.
+This is the main stochastic validation gate for the covariance-preserving
+sampler. The sampler draws a fixed number of events from each selected
+hyperposterior row, so the default validation target is the equal-row average of
+per-row normalized released grids.
+
+Important redshift convention:
+    The released ``rates_on_grids/redshift`` product for the GWTC-4 BBH file is
+    a comoving source-frame rate-density grid, R(z) ∝ (1 + z)^lambda. It is not
+    the detector-frame event-redshift sampling PDF, which includes
+    ``dVc/dz / (1 + z)``. Therefore this script compares event samples to the
+    released grids for masses and spins only. Redshift is written as a separate
+    deterministic rate-density check.
 """
 
 from __future__ import annotations
@@ -25,11 +32,10 @@ from popsampler.models import (
 from popsampler.popsummary_io import get_hyperparameter_samples
 
 
-PARAMETERS = ["mass_1", "mass_ratio", "redshift", "a_1", "a_2", "cos_tilt_1", "cos_tilt_2"]
+SAMPLE_DISTRIBUTION_PARAMETERS = ["mass_1", "mass_ratio", "a_1", "a_2", "cos_tilt_1", "cos_tilt_2"]
 SAMPLE_COLUMNS = {
     "mass_1": "mass_1_source",
     "mass_ratio": "mass_ratio",
-    "redshift": "redshift",
     "a_1": "a_1",
     "a_2": "a_2",
     "cos_tilt_1": "cos_tilt_1",
@@ -46,7 +52,7 @@ def normalized_pdf(x: np.ndarray, rate: np.ndarray) -> np.ndarray:
 
 
 def target_pdf_from_grid(x: np.ndarray, rates: np.ndarray, *, target_weighting: str) -> np.ndarray:
-    """Construct the grid target for the sampler's catalog weighting.
+    """Construct a normalized target from released per-row rate curves.
 
     equal_row_pdf:
         Normalize each hyperposterior row's rate curve first, then average the
@@ -77,7 +83,7 @@ def weighted_quantile_from_pdf(x: np.ndarray, pdf: np.ndarray, q: float) -> floa
     return float(np.interp(q, cdf, x))
 
 
-def compare_parameter(
+def compare_sample_parameter(
     df: pd.DataFrame,
     h5: Path,
     rows: np.ndarray,
@@ -86,6 +92,11 @@ def compare_parameter(
     *,
     target_weighting: str,
 ) -> dict[str, float | str]:
+    """Compare sampled event parameters to released 1D grids.
+
+    Do not use this for redshift: the released redshift grid is a comoving
+    rate-density curve, not the detector-frame event-redshift distribution.
+    """
     grid = load_rate_grid(h5, name)
     x = grid.positions
     pdf = target_pdf_from_grid(x, grid.rates[rows], target_weighting=target_weighting)
@@ -103,6 +114,7 @@ def compare_parameter(
 
     return {
         "name": name,
+        "comparison_type": "event_sample_vs_released_grid",
         "target_weighting": target_weighting,
         "hist_l1": l1,
         "mc_mean": mc_mean,
@@ -117,6 +129,54 @@ def compare_parameter(
     }
 
 
+def redshift_rate_density_pdf(z: np.ndarray, lamb: float) -> np.ndarray:
+    """Normalized comoving source-frame rate-density shape R(z) ∝ (1+z)^lambda."""
+    return normalized_pdf(z, np.power(1.0 + np.asarray(z, dtype=float), float(lamb)))
+
+
+def compare_redshift_rate_density(
+    hyper: pd.DataFrame,
+    h5: Path,
+    rows: np.ndarray,
+    *,
+    target_weighting: str,
+) -> dict[str, float | str]:
+    """Compare released redshift grid to paper-defined comoving rate density.
+
+    This deliberately does not use the sampled event redshifts. The event
+    redshift distribution includes volume and detector-frame time-dilation
+    factors, while the released grid stores the shape of R(z).
+    """
+    grid = load_rate_grid(h5, "redshift")
+    z = grid.positions
+    target = target_pdf_from_grid(z, grid.rates[rows], target_weighting=target_weighting)
+    model = normalized_pdf(
+        z,
+        np.mean([redshift_rate_density_pdf(z, float(hyper.iloc[int(idx)]["lamb"])) for idx in rows], axis=0),
+    )
+
+    model_mean = float(np.trapezoid(z * model, z))
+    grid_mean = float(np.trapezoid(z * target, z))
+    model_q05, model_q50, model_q95 = [weighted_quantile_from_pdf(z, model, q) for q in [0.05, 0.50, 0.95]]
+    grid_q05, grid_q50, grid_q95 = [weighted_quantile_from_pdf(z, target, q) for q in [0.05, 0.50, 0.95]]
+
+    return {
+        "name": "redshift",
+        "comparison_type": "rate_density_model_vs_released_grid",
+        "target_weighting": target_weighting,
+        "hist_l1": float(np.trapezoid(np.abs(model - target), z)),
+        "model_mean": model_mean,
+        "grid_mean": grid_mean,
+        "mean_abs_diff": abs(model_mean - grid_mean),
+        "model_q05": model_q05,
+        "grid_q05": grid_q05,
+        "model_q50": model_q50,
+        "grid_q50": grid_q50,
+        "model_q95": model_q95,
+        "grid_q95": grid_q95,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--h5", required=True, help="Path to GWTC-4 popsummary HDF5 file")
@@ -125,7 +185,12 @@ def main() -> None:
     parser.add_argument("--events-per-row", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--bins", type=int, default=150)
-    parser.add_argument("--z-max", type=float, default=1.9, help="Use 1.9 for released redshift-grid validation; use larger for CE generation")
+    parser.add_argument(
+        "--z-max",
+        type=float,
+        default=1.9,
+        help="Upper redshift for generated event samples. This is not the released redshift-grid target.",
+    )
     parser.add_argument("--no-extrinsics", action="store_true")
     parser.add_argument(
         "--target-weighting",
@@ -169,7 +234,7 @@ def main() -> None:
     samples.to_parquet(samples_path, index=False)
 
     diagnostics = [
-        compare_parameter(
+        compare_sample_parameter(
             samples,
             h5,
             rows,
@@ -177,16 +242,24 @@ def main() -> None:
             args.bins,
             target_weighting=args.target_weighting,
         )
-        for name in PARAMETERS
+        for name in SAMPLE_DISTRIBUTION_PARAMETERS
     ]
     diag = pd.DataFrame(diagnostics)
     diag_path = outdir / "joint_sampler_grid_diagnostics.csv"
     diag.to_csv(diag_path, index=False)
 
+    redshift_diag = pd.DataFrame(
+        [compare_redshift_rate_density(hyper, h5, rows, target_weighting=args.target_weighting)]
+    )
+    redshift_diag_path = outdir / "redshift_rate_density_diagnostics.csv"
+    redshift_diag.to_csv(redshift_diag_path, index=False)
+
     print(f"target_weighting: {args.target_weighting}")
     print(f"wrote {samples_path}")
     print(f"wrote {diag_path}")
     print(diag.to_string(index=False))
+    print(f"wrote {redshift_diag_path}")
+    print(redshift_diag.to_string(index=False))
 
 
 if __name__ == "__main__":
