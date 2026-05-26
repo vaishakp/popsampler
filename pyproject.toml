@@ -22,11 +22,13 @@ dependencies = [
 [project.optional-dependencies]
 gwtc4 = ["popsummary"]
 parquet = ["pyarrow>=14"]
+plot = ["matplotlib>=3.7"]
 dev = ["pytest", "ruff"]
 
 [project.scripts]
 popsampler-download-gwtc4 = "popsampler.scripts.download_gwtc4:main"
 popsampler-inspect = "popsampler.scripts.inspect_popsummary:main"
+popsampler-plot-grid-marginals = "popsampler.scripts.plot_grid_marginals:main"
 popsampler-sample-bbh = "popsampler.scripts.sample_bbh:main"
 
 [tool.setuptools.packages.find]
