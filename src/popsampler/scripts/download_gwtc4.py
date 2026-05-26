@@ -13,6 +13,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--record-id", type=int, default=16911563)
     parser.add_argument("--force", action="store_true", help="Redownload/reextract existing products")
     parser.add_argument("--no-extract", action="store_true", help="Only download the tarball")
+    parser.add_argument("--no-progress", action="store_true", help="Disable download/extraction progress bars")
     args = parser.parse_args(argv)
 
     product = download_gwtc4_bbh(
@@ -20,6 +21,7 @@ def main(argv: list[str] | None = None) -> None:
         record_id=args.record_id,
         force=args.force,
         extract=not args.no_extract,
+        progress=not args.no_progress,
     )
     print(f"cache_dir       : {product.cache_dir}")
     print(f"tarball         : {product.tarball}")
