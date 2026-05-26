@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import requests
+from tqdm.auto import tqdm
 
 
 ZENODO_RECORD_API = "https://zenodo.org/api/records/{record_id}"
@@ -54,7 +55,24 @@ def find_zenodo_file(record: dict, filename: str) -> dict:
     raise FileNotFoundError(f"Could not find {filename!r}. Available files: {available}")
 
 
-def download_file(url: str, output: Path, *, force: bool = False, chunk_size: int = 1024 * 1024) -> Path:
+def _content_length(response: requests.Response) -> int | None:
+    value = response.headers.get("content-length")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def download_file(
+    url: str,
+    output: Path,
+    *,
+    force: bool = False,
+    chunk_size: int = 1024 * 1024,
+    progress: bool = True,
+) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists() and not force:
         return output
@@ -62,24 +80,36 @@ def download_file(url: str, output: Path, *, force: bool = False, chunk_size: in
     tmp = output.with_suffix(output.suffix + ".part")
     with requests.get(url, stream=True, timeout=60) as response:
         response.raise_for_status()
+        total = _content_length(response)
         with tmp.open("wb") as fp:
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    fp.write(chunk)
+            with tqdm(
+                total=total,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc=f"Downloading {output.name}",
+                disable=not progress,
+            ) as bar:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        fp.write(chunk)
+                        bar.update(len(chunk))
     os.replace(tmp, output)
     return output
 
 
-def safe_extract_tar(tar_path: Path, output_dir: Path) -> None:
+def safe_extract_tar(tar_path: Path, output_dir: Path, *, progress: bool = True) -> None:
     """Extract a tar archive while preventing path traversal."""
     output_dir.mkdir(parents=True, exist_ok=True)
     base = output_dir.resolve()
     with tarfile.open(tar_path, "r") as tar:
-        for member in tar.getmembers():
+        members = tar.getmembers()
+        for member in members:
             target = (output_dir / member.name).resolve()
             if not str(target).startswith(str(base)):
                 raise RuntimeError(f"Refusing to extract unsafe tar member {member.name!r}")
-        tar.extractall(output_dir)
+        for member in tqdm(members, desc=f"Extracting {tar_path.name}", disable=not progress):
+            tar.extract(member, output_dir)
 
 
 def download_gwtc4_bbh(
@@ -89,6 +119,7 @@ def download_gwtc4_bbh(
     tarball_name: str = DEFAULT_BBH_TARBALL,
     force: bool = False,
     extract: bool = True,
+    progress: bool = True,
 ) -> DownloadedProduct:
     """Download the GWTC-4 population BBH tarball and optionally extract it."""
     cache_dir = Path(cache_dir).expanduser().resolve()
@@ -102,7 +133,7 @@ def download_gwtc4_bbh(
         url = f"https://zenodo.org/records/{record_id}/files/{quote(tarball_name)}?download=1"
 
     tarball = cache_dir / tarball_name
-    download_file(url, tarball, force=force)
+    download_file(url, tarball, force=force, progress=progress)
 
     checksum = file_info.get("checksum")
     if checksum and checksum.startswith("md5:"):
@@ -112,7 +143,7 @@ def download_gwtc4_bbh(
 
     extracted_dir = cache_dir / tarball_name.removesuffix(".tar")
     if extract and (force or not extracted_dir.exists()):
-        safe_extract_tar(tarball, extracted_dir)
+        safe_extract_tar(tarball, extracted_dir, progress=progress)
 
     candidates = list(extracted_dir.rglob(DEFAULT_BBH_H5)) if extracted_dir.exists() else []
     default_h5 = candidates[0] if candidates else None
