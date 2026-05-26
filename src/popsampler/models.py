@@ -94,8 +94,9 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
         ``sigpp_1, sigpp_2``
 
     spins:
-        ``alpha_chi, beta_chi, amax, mu_chi, sigma_chi,``
-        ``mu_spin, sigma_spin, xi_spin``
+        ``mu_chi, sigma_chi, mu_spin, sigma_spin, xi_spin``. The file also
+        contains ``alpha_chi, beta_chi, amax`` columns, but the Gaussian-component
+        sampler convention uses the five parameters above for generation.
 
     redshift/rate:
         ``lamb`` and optionally ``rate`` / ``log_10_rate``.
@@ -108,15 +109,13 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
     secondary-mass low-mass smoothing factor. This is the critical improvement
     over independent 1D marginal sampling.
 
-    The spin implementation is intentionally conservative. Some popsummary rows
-    expose ``alpha_chi``/``beta_chi`` values that are not positive. Those appear
-    to be derived beta-shape parameters from the mean/width parameterization,
-    not always valid independent sampled parameters. When the beta-shape pair is
-    valid, the code uses a beta-plus-truncated-normal spin-magnitude mixture; if
-    not, it falls back to the named truncated-normal ``mu_chi``/``sigma_chi``
-    component and records this in ``spin_magnitude_sampler_mode``. The released
-    ``a_1``/``a_2`` grids are the validation target for choosing the final spin
-    convention.
+    The spin sampler follows the Gaussian-component convention used by the
+    release-style simulation code: spin magnitudes are independent truncated
+    Gaussians on ``[0, 1]`` with ``mu_chi`` and ``sigma_chi``; each binary draws a
+    single formation channel with probability ``xi_spin``. In the Gaussian
+    channel, both spin tilts are drawn from a truncated Gaussian on ``[-1, 1]``
+    with ``mu_spin`` and ``sigma_spin``. In the isotropic/dynamical channel, both
+    spin tilts are uniform on ``[-1, 1]``.
     """
 
     name = "BBHMassSpinRedshift_BrokenPowerLawTwoPeaks_GaussianComponentSpins_PowerLawRedshift"
@@ -139,9 +138,6 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
         "sigpp_2",
     )
     SPIN_PARAMETERS = (
-        "alpha_chi",
-        "beta_chi",
-        "amax",
         "mu_chi",
         "sigma_chi",
         "mu_spin",
@@ -173,9 +169,9 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
             raise ModelValidationError("Gaussian peak widths sigpp_1/sigpp_2 must be positive")
         if _required(row, "sigma_chi") <= 0 or _required(row, "sigma_spin") <= 0:
             raise ModelValidationError("Gaussian spin parameters sigma_chi/sigma_spin must be positive")
-        amax = _required(row, "amax")
-        if not (0 < amax <= 1.0):
-            raise ModelValidationError(f"Expected 0 < amax <= 1, got {amax}")
+        xi = _required(row, "xi_spin")
+        if not (0.0 <= xi <= 1.0):
+            raise ModelValidationError(f"Expected 0 <= xi_spin <= 1, got {xi}")
 
     def sample(
         self,
@@ -353,19 +349,52 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
         *,
         rng: np.random.Generator,
     ) -> dict[str, np.ndarray]:
-        amax = _required(row, "amax")
-        xi = np.clip(_required(row, "xi_spin"), 0.0, 1.0)
+        xi = _required(row, "xi_spin")
 
-        a1 = self._sample_spin_magnitude(row, n, rng)
-        a2 = self._sample_spin_magnitude(row, n, rng)
-        spin_mode = self._spin_magnitude_sampler_mode(row)
+        a1 = self._sample_truncated_normal(
+            low=0.0,
+            high=1.0,
+            mu=_required(row, "mu_chi"),
+            sigma=_required(row, "sigma_chi"),
+            n=n,
+            rng=rng,
+        )
+        a2 = self._sample_truncated_normal(
+            low=0.0,
+            high=1.0,
+            mu=_required(row, "mu_chi"),
+            sigma=_required(row, "sigma_chi"),
+            n=n,
+            rng=rng,
+        )
 
-        cos1 = self._sample_cos_tilt(row, n, rng, xi=xi)
-        cos2 = self._sample_cos_tilt(row, n, rng, xi=xi)
+        is_gaussian_binary = rng.binomial(1, xi, size=n).astype(bool)
+        cos1 = np.empty(n)
+        cos2 = np.empty(n)
+        n_gauss = int(np.sum(is_gaussian_binary))
+        n_iso = n - n_gauss
 
-        # Hard clip in case numerical interpolation returns a boundary overshoot.
-        a1 = np.clip(a1, 0.0, amax)
-        a2 = np.clip(a2, 0.0, amax)
+        if n_gauss > 0:
+            cos1[is_gaussian_binary] = self._sample_truncated_normal(
+                low=-1.0,
+                high=1.0,
+                mu=_required(row, "mu_spin"),
+                sigma=_required(row, "sigma_spin"),
+                n=n_gauss,
+                rng=rng,
+            )
+            cos2[is_gaussian_binary] = self._sample_truncated_normal(
+                low=-1.0,
+                high=1.0,
+                mu=_required(row, "mu_spin"),
+                sigma=_required(row, "sigma_spin"),
+                n=n_gauss,
+                rng=rng,
+            )
+        if n_iso > 0:
+            cos1[~is_gaussian_binary] = rng.uniform(-1.0, 1.0, size=n_iso)
+            cos2[~is_gaussian_binary] = rng.uniform(-1.0, 1.0, size=n_iso)
+
         cos1 = np.clip(cos1, -1.0, 1.0)
         cos2 = np.clip(cos2, -1.0, 1.0)
 
@@ -378,74 +407,25 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
             "tilt_2": np.arccos(cos2),
             "phi_12": rng.uniform(0.0, 2.0 * np.pi, size=n),
             "phi_jl": rng.uniform(0.0, 2.0 * np.pi, size=n),
-            "spin_magnitude_sampler_mode": np.full(n, spin_mode, dtype=object),
+            "spin_sampler_mode": np.full(n, "joint_gaussian_component_spins", dtype=object),
+            "spin_gaussian_binary_channel": is_gaussian_binary,
         }
 
-    def _sample_spin_magnitude(
+    def _sample_truncated_normal(
         self,
-        row: Mapping[str, float],
-        n: int,
-        rng: np.random.Generator,
-    ) -> np.ndarray:
-        a_grid, pdf = self._spin_magnitude_pdf(row)
-        return InverseCDFSampler.from_pdf(a_grid, pdf).sample(n, rng)
-
-    def _spin_magnitude_sampler_mode(self, row: Mapping[str, float]) -> str:
-        if self._has_valid_beta_spin_shapes(row):
-            return "beta_plus_truncated_normal"
-        return "truncated_normal_only_invalid_beta_shapes"
-
-    def _spin_magnitude_pdf(self, row: Mapping[str, float]) -> tuple[np.ndarray, np.ndarray]:
-        amax = _required(row, "amax")
-        a_grid = np.linspace(0.0, amax, self.config.spin_grid_size)
-        gaussian_pdf = self._normal_pdf(
-            a_grid,
-            _required(row, "mu_chi"),
-            _required(row, "sigma_chi"),
-        )
-        gaussian_pdf = np.where((a_grid >= 0.0) & (a_grid <= amax), gaussian_pdf, 0.0)
-        gaussian_pdf = _trapz_normalize(a_grid, gaussian_pdf, label="spin truncated-normal component")
-
-        if not self._has_valid_beta_spin_shapes(row):
-            return a_grid, gaussian_pdf
-
-        beta_pdf = self._beta_spin_pdf(a_grid, row)
-        beta_pdf = _trapz_normalize(a_grid, beta_pdf, label="spin beta component")
-        # This mixture convention is explicitly empirical until validated against
-        # the released a_1/a_2 grids.
-        xi = np.clip(_required(row, "xi_spin"), 0.0, 1.0)
-        pdf = (1.0 - xi) * beta_pdf + xi * gaussian_pdf
-        return a_grid, pdf
-
-    def _has_valid_beta_spin_shapes(self, row: Mapping[str, float]) -> bool:
-        alpha_chi = _required(row, "alpha_chi")
-        beta_chi = _required(row, "beta_chi")
-        return alpha_chi > 0.0 and beta_chi > 0.0
-
-    def _beta_spin_pdf(self, a: np.ndarray, row: Mapping[str, float]) -> np.ndarray:
-        alpha_chi = _required(row, "alpha_chi")
-        beta_chi = _required(row, "beta_chi")
-        amax = _required(row, "amax")
-        x = np.clip(np.asarray(a, dtype=float) / amax, 0.0, 1.0)
-        pdf = np.zeros_like(x)
-        mask = (x > 0.0) & (x < 1.0)
-        pdf[mask] = np.power(x[mask], alpha_chi - 1.0) * np.power(1.0 - x[mask], beta_chi - 1.0)
-        return np.clip(pdf, 0.0, np.inf)
-
-    def _sample_cos_tilt(
-        self,
-        row: Mapping[str, float],
-        n: int,
-        rng: np.random.Generator,
         *,
-        xi: float,
+        low: float,
+        high: float,
+        mu: float,
+        sigma: float,
+        n: int,
+        rng: np.random.Generator,
     ) -> np.ndarray:
-        cos_grid = np.linspace(-1.0, 1.0, self.config.spin_grid_size)
-        isotropic_pdf = np.full_like(cos_grid, 0.5)
-        gaussian_pdf = self._normal_pdf(cos_grid, _required(row, "mu_spin"), _required(row, "sigma_spin"))
-        gaussian_pdf = _trapz_normalize(cos_grid, gaussian_pdf, label="cos-tilt Gaussian component")
-        pdf = (1.0 - xi) * isotropic_pdf + xi * gaussian_pdf
-        return InverseCDFSampler.from_pdf(cos_grid, pdf).sample(n, rng)
+        grid = np.linspace(low, high, self.config.spin_grid_size)
+        pdf = self._normal_pdf(grid, mu, sigma)
+        pdf = np.where((grid >= low) & (grid <= high), pdf, 0.0)
+        pdf = _trapz_normalize(grid, pdf, label=f"truncated normal [{low}, {high}]")
+        return InverseCDFSampler.from_pdf(grid, pdf).sample(n, rng)
 
 
 # Backwards-compatible public name used by the current CLI and posterior sampler.
