@@ -13,7 +13,7 @@ instead of silently substituting guessed defaults.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping
 
 import numpy as np
@@ -55,7 +55,7 @@ class BBHDefaultModelConfig:
     mass_grid_size: int = 4096
     q_grid_size: int = 2048
     z_grid_size: int = 4096
-    cosmology: object = DEFAULT_COSMOLOGY
+    cosmology: object = field(default_factory=lambda: DEFAULT_COSMOLOGY)
 
 
 class BrokenPowerLawTwoPeaksGaussianSpinsPowerLawRedshift:
