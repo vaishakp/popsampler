@@ -16,6 +16,7 @@ dependencies = [
     "h5py>=3.8",
     "requests>=2.31",
     "astropy>=5.3",
+    "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]
