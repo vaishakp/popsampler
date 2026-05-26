@@ -1,10 +1,17 @@
-"""Use gwpopulation mass PDFs for posterior-predictive mass draws."""
+"""Use gwpopulation mass-model machinery for posterior-predictive mass draws.
+
+The public gwpopulation 1.3.1 release contains the smoothing/normalization base
+class used by LVK-style mass models, but it does not expose a ready-made
+`BrokenPowerLawTwoPeaksSmoothedMassDistribution` class. This module therefore
+builds that missing model by subclassing gwpopulation's base smoothed mass class,
+while delegating the broken-power-law and Gaussian-peak component conventions to
+gwpopulation functions.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Mapping
-import inspect
 
 import numpy as np
 
@@ -16,11 +23,9 @@ class GWPopulationMassModelError(RuntimeError):
 
 
 CANDIDATE_CLASS_NAMES = (
+    "GWTC4BrokenPowerLawTwoPeaksSmoothedMassDistribution",
     "MultiPeakSmoothedMassDistribution",
-    "BrokenPowerLawTwoPeaksSmoothedMassDistribution",
-    "BrokenPowerLawTwoPeakSmoothedMassDistribution",
     "BrokenPowerLawPeakSmoothedMassDistribution",
-    "TwoPeakSmoothedMassDistribution",
     "BrokenPowerLawSmoothedMassDistribution",
 )
 
@@ -99,38 +104,100 @@ class GWPopulationMassSampler:
 
     def evaluate_joint(self, row: Mapping[str, float], mass_1: np.ndarray, mass_ratio: np.ndarray) -> np.ndarray:
         model = self._ensure_model(row)
-        dataset = self._dataset(mass_1, mass_ratio)
-        values = self._call_model(model, dataset, self._row_to_kwargs(row))
+        values = model(self._dataset(mass_1, mass_ratio), **self._row_to_kwargs(row))
         return np.clip(np.asarray(values, dtype=float).reshape(np.asarray(mass_1).shape), 0.0, np.inf)
 
     def _ensure_model(self, row: Mapping[str, float]) -> Any:
+        row_mmax = max(float(row.get("mmax", self.config.m1_max)), self.config.m1_max)
         if self._model is not None:
+            if getattr(self._model, "mmax", row_mmax) >= row_mmax:
+                return self._model
+            self._model = None
+            self._model_name = None
+
+        cls = self._build_broken_power_law_two_peak_class()
+        try:
+            self._model = cls(
+                mmin=self.config.m1_min,
+                mmax=row_mmax,
+                normalization_shape=(self.config.mass_grid_size, self.config.q_grid_size),
+            )
+            self._model_name = cls.__name__
+            test = self._model(
+                self._dataset(np.array([20.0, 40.0]), np.array([0.8, 0.5])),
+                **self._row_to_kwargs(row),
+            )
+            if not (np.all(np.isfinite(test)) and np.any(np.asarray(test) > 0)):
+                raise GWPopulationMassModelError(f"non-positive/non-finite smoke-test values {test}")
             return self._model
-        errors: list[str] = []
-        for name in CANDIDATE_CLASS_NAMES:
-            cls = getattr(self.gwpop_mass, name, None)
-            if cls is None:
-                continue
-            for kwargs in ({}, {"mmin": self.config.m1_min, "mmax": self.config.m1_max}):
-                try:
-                    model = cls(**kwargs)
-                    test = self._call_model(
-                        model,
-                        self._dataset(np.array([10.0, 20.0]), np.array([0.8, 0.5])),
-                        self._row_to_kwargs(row),
-                    )
-                    if np.all(np.isfinite(test)) and np.any(np.asarray(test) > 0):
-                        self._model = model
-                        self._model_name = name
-                        return model
-                    errors.append(f"{name}{kwargs}: non-positive test values {test}")
-                except Exception as exc:
-                    errors.append(f"{name}{kwargs}: {type(exc).__name__}: {exc}")
-        available = [name for name in CANDIDATE_CLASS_NAMES if hasattr(self.gwpop_mass, name)]
-        raise GWPopulationMassModelError(
-            "Could not find a usable gwpopulation mass model. "
-            f"Available candidates: {available}. Attempts:\n" + "\n".join(errors[:30])
-        )
+        except Exception as exc:
+            raise GWPopulationMassModelError(
+                "Could not instantiate/evaluate the gwpopulation-backed GWTC-4 broken-power-law two-peak model: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+    def _build_broken_power_law_two_peak_class(self):
+        mass = self.gwpop_mass
+
+        def broken_power_law_two_peak_primary_mass(
+            mass_array,
+            alpha_1,
+            alpha_2,
+            mmin,
+            mmax,
+            break_fraction,
+            lam,
+            lam_1,
+            mpp_1,
+            mpp_2,
+            sigpp_1,
+            sigpp_2,
+            gaussian_mass_maximum=100,
+        ):
+            continuum = mass.double_power_law_primary_mass(
+                mass_array,
+                alpha_1=alpha_1,
+                alpha_2=alpha_2,
+                mmin=mmin,
+                mmax=mmax,
+                break_fraction=break_fraction,
+            )
+            lower_peak = mass.double_power_law_peak_primary_mass(
+                mass_array,
+                alpha_1=alpha_1,
+                alpha_2=alpha_2,
+                mmin=mmin,
+                mmax=mmax,
+                break_fraction=break_fraction,
+                lam=1.0,
+                mpp=mpp_1,
+                sigpp=sigpp_1,
+                gaussian_mass_maximum=gaussian_mass_maximum,
+            )
+            upper_peak = mass.double_power_law_peak_primary_mass(
+                mass_array,
+                alpha_1=alpha_1,
+                alpha_2=alpha_2,
+                mmin=mmin,
+                mmax=mmax,
+                break_fraction=break_fraction,
+                lam=1.0,
+                mpp=mpp_2,
+                sigpp=sigpp_2,
+                gaussian_mass_maximum=gaussian_mass_maximum,
+            )
+            lam = float(np.clip(lam, 0.0, 1.0))
+            lam_1 = float(np.clip(lam_1, 0.0, 1.0))
+            return (1.0 - lam) * continuum + lam * (lam_1 * lower_peak + (1.0 - lam_1) * upper_peak)
+
+        class GWTC4BrokenPowerLawTwoPeaksSmoothedMassDistribution(mass.BaseSmoothedMassDistribution):
+            primary_model = staticmethod(broken_power_law_two_peak_primary_mass)
+
+            @property
+            def kwargs(self):
+                return dict(gaussian_mass_maximum=self.mmax)
+
+        return GWTC4BrokenPowerLawTwoPeaksSmoothedMassDistribution
 
     @staticmethod
     def _dataset(mass_1: np.ndarray, mass_ratio: np.ndarray) -> dict[str, np.ndarray]:
@@ -140,51 +207,25 @@ class GWPopulationMassSampler:
 
     @staticmethod
     def _row_to_kwargs(row: Mapping[str, float]) -> dict[str, float]:
-        out = {str(k): float(v) for k, v in row.items() if np.isscalar(v) and np.isfinite(float(v))}
-        if "mlow_1" in out:
-            out.setdefault("mmin", out["mlow_1"])
-            out.setdefault("mmin_1", out["mlow_1"])
-        if "mlow_2" in out:
-            out.setdefault("mmin_2", out["mlow_2"])
-        if "delta_m_1" in out:
-            out.setdefault("delta_m", out["delta_m_1"])
-        return out
-
-    def _call_model(self, model: Any, dataset: dict[str, np.ndarray], kwargs: dict[str, float]) -> np.ndarray:
-        # Some gwpopulation callables expect hyperparameters as keyword arguments;
-        # some helper functions/classes read them directly from the data dict.
-        dataset_with_params = dict(dataset)
-        dataset_with_params.update(kwargs)
-        filtered_kwargs = self._filter_kwargs(model, kwargs)
-        attempts = (
-            lambda: model(dataset, **kwargs),
-            lambda: model(dataset_with_params),
-            lambda: model(dataset_with_params, **kwargs),
-            lambda: model(dataset, **filtered_kwargs),
-            lambda: model(dataset_with_params, **self._filter_kwargs(model, kwargs)),
-            lambda: model(dataset, kwargs),
-        )
-        last_exc: Exception | None = None
-        for attempt in attempts:
-            try:
-                values = attempt()
-                if isinstance(values, Mapping):
-                    for key in ("mass", "pdf", "probability", "p_m1_q"):
-                        if key in values:
-                            return np.asarray(values[key], dtype=float)
-                    raise GWPopulationMassModelError(f"gwpopulation returned mapping keys {list(values)}")
-                return np.asarray(values, dtype=float)
-            except Exception as exc:
-                last_exc = exc
-        raise GWPopulationMassModelError(f"gwpopulation call failed: {last_exc}")
-
-    @staticmethod
-    def _filter_kwargs(func: Any, kwargs: dict[str, float]) -> dict[str, float]:
-        try:
-            signature = inspect.signature(func)
-        except Exception:
-            return kwargs
-        params = signature.parameters
-        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
-            return kwargs
-        return {key: value for key, value in kwargs.items() if key in params}
+        mmin = float(row["mlow_1"])
+        mmax = float(row["mmax"])
+        break_mass = float(row["break_mass"])
+        if 0.0 < break_mass < 1.0:
+            break_fraction = break_mass
+        else:
+            break_fraction = (break_mass - mmin) / (mmax - mmin)
+        return {
+            "alpha_1": float(row["alpha_1"]),
+            "alpha_2": float(row["alpha_2"]),
+            "beta": float(row["beta"]),
+            "mmin": mmin,
+            "mmax": mmax,
+            "break_fraction": float(np.clip(break_fraction, 0.0, 1.0)),
+            "lam": float(row["lam_0"]),
+            "lam_1": float(row["lam_1"]),
+            "mpp_1": float(row["mpp_1"]),
+            "mpp_2": float(row["mpp_2"]),
+            "sigpp_1": float(row["sigpp_1"]),
+            "sigpp_2": float(row["sigpp_2"]),
+            "delta_m": float(row["delta_m_1"]),
+        }
