@@ -83,7 +83,11 @@ class GWPopulationMassSampler:
     def sample_mass_ratio_conditional(self, row: Mapping[str, float], mass_1: np.ndarray, *, rng: np.random.Generator) -> np.ndarray:
         mass_1 = np.asarray(mass_1, dtype=float)
         q_grid = np.linspace(self.config.q_min, self.config.q_max, self.config.q_grid_size)
-        pdf = self.conditional_mass_ratio_pdf(row, mass_1, q_grid)
+        pdf = self.conditional_mass_ratio_pdf(row, mass_1, q_grid, pairwise=False)
+        if pdf.ndim != 2:
+            raise GWPopulationMassModelError(
+                f"Expected conditional q PDF to be 2D with shape (n_m1, n_q); got {pdf.shape}"
+            )
         cdf = np.cumsum(pdf, axis=1)
         totals = cdf[:, -1]
         q = np.empty(len(mass_1), dtype=float)
@@ -102,7 +106,7 @@ class GWPopulationMassSampler:
         mass_1 = np.asarray(mass_1, dtype=float)
         mass_ratio = np.asarray(mass_ratio, dtype=float)
         p_m1 = self.primary_mass_pdf(row, mass_1)
-        p_q = self.conditional_mass_ratio_pdf(row, mass_1, mass_ratio)
+        p_q = self.conditional_mass_ratio_pdf(row, mass_1, mass_ratio, pairwise=True)
         return np.clip(p_m1 * p_q, 0.0, np.inf)
 
     def primary_mass_pdf(self, row: Mapping[str, float], mass_1: np.ndarray) -> np.ndarray:
@@ -144,15 +148,27 @@ class GWPopulationMassSampler:
         pdf = (1.0 - lam) * continuum + lam * (lam_1 * lower_peak + (1.0 - lam_1) * upper_peak)
         return self._trapz_normalize(mass_1, pdf)
 
-    def conditional_mass_ratio_pdf(self, row: Mapping[str, float], mass_1: np.ndarray, mass_ratio: np.ndarray) -> np.ndarray:
+    def conditional_mass_ratio_pdf(
+        self,
+        row: Mapping[str, float],
+        mass_1: np.ndarray,
+        mass_ratio: np.ndarray,
+        *,
+        pairwise: bool = False,
+    ) -> np.ndarray:
         mass_1 = np.asarray(mass_1, dtype=float)
         mass_ratio = np.asarray(mass_ratio, dtype=float)
-        if mass_ratio.ndim == 1 and mass_1.ndim == 1 and len(mass_ratio) != len(mass_1):
-            q = np.repeat(mass_ratio[None, :], len(mass_1), axis=0)
-            m1 = np.repeat(mass_1[:, None], len(mass_ratio), axis=1)
-        else:
+        if pairwise:
             q = mass_ratio
             m1 = mass_1
+            q_axis = None
+        else:
+            # In sampling mode, a 1D mass_1 array and a 1D q grid should always
+            # produce a 2D (n_mass_1, n_q) conditional PDF. Do not infer pairwise
+            # intent from equal lengths; n_events can equal q_grid_size.
+            q = np.repeat(mass_ratio[None, :], len(mass_1), axis=0)
+            m1 = np.repeat(mass_1[:, None], len(mass_ratio), axis=1)
+            q_axis = mass_ratio
         beta = float(row["beta"])
         mlow_2 = float(row["mlow_2"])
         delta_m_2 = float(row["delta_m_2"])
@@ -160,13 +176,13 @@ class GWPopulationMassSampler:
         pdf = np.power(np.maximum(q, 1e-300), beta)
         pdf *= self._low_mass_smoothing(m2, mlow_2, delta_m_2, high=m1)
         pdf = np.where((q > 0.0) & (q <= 1.0) & (m2 <= m1), pdf, 0.0)
-        if pdf.ndim == 2:
-            norms = np.trapz(pdf, mass_ratio, axis=1)
-            good = np.isfinite(norms) & (norms > 0)
-            out = np.zeros_like(pdf)
-            out[good] = pdf[good] / norms[good, None]
-            return out
-        return np.clip(pdf, 0.0, np.inf)
+        if pairwise:
+            return np.clip(pdf, 0.0, np.inf)
+        norms = np.trapz(pdf, q_axis, axis=1)
+        good = np.isfinite(norms) & (norms > 0)
+        out = np.zeros_like(pdf)
+        out[good] = pdf[good] / norms[good, None]
+        return out
 
     @staticmethod
     def _dataset(mass_1: np.ndarray, mass_ratio: np.ndarray) -> dict[str, np.ndarray]:
@@ -212,7 +228,7 @@ class GWPopulationMassSampler:
         out[y >= 1.0] = 1.0
         mask = (y > 0.0) & (y < 1.0)
         y_clip = np.clip(y[mask], 1e-12, 1.0 - 1e-12)
-        exponent = 1.0 / y_clip + 1.0 / (y_clip - 1.0)
+        exponent = np.clip(1.0 / y_clip + 1.0 / (y_clip - 1.0), -700.0, 700.0)
         out[mask] = 1.0 / (np.exp(exponent) + 1.0)
         return np.where(x <= high, out, 0.0)
 
