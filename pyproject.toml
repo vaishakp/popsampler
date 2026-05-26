@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gwtc4 = ["popsummary"]
+gwtc4 = ["popsummary", "gwpopulation"]
 parquet = ["pyarrow>=14"]
 plot = ["matplotlib>=3.7"]
 dev = ["pytest", "ruff"]
