@@ -1,17 +1,18 @@
 """Use gwpopulation mass-model machinery for posterior-predictive mass draws.
 
-The public gwpopulation 1.3.1 release contains the smoothing/normalization base
-class used by LVK-style mass models, but it does not expose a ready-made
-`BrokenPowerLawTwoPeaksSmoothedMassDistribution` class. This module therefore
-builds that missing model by subclassing gwpopulation's base smoothed mass class,
-while delegating the broken-power-law and Gaussian-peak component conventions to
-gwpopulation functions.
+The public gwpopulation 1.3.1 release provides the authoritative primary-mass
+component functions for LVK-style broken-power-law and Gaussian-peak models, but
+it does not expose a ready-made GWTC-4 two-peak class with separate primary and
+secondary low-mass smoothing scales. This module therefore uses gwpopulation for
+the primary-mass components and implements the asymmetric conditional
+``p(q | mass_1)`` layer needed by the GWTC-4 parameter names ``mlow_2`` and
+``delta_m_2``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Mapping
 
 import numpy as np
 
@@ -23,7 +24,7 @@ class GWPopulationMassModelError(RuntimeError):
 
 
 CANDIDATE_CLASS_NAMES = (
-    "GWTC4BrokenPowerLawTwoPeaksSmoothedMassDistribution",
+    "GWTC4AsymmetricBrokenPowerLawTwoPeaksMassDistribution",
     "MultiPeakSmoothedMassDistribution",
     "BrokenPowerLawPeakSmoothedMassDistribution",
     "BrokenPowerLawSmoothedMassDistribution",
@@ -38,10 +39,11 @@ class GWPopulationMassSamplerConfig:
     q_max: float = 1.0
     mass_grid_size: int = 1200
     q_grid_size: int = 500
+    gaussian_mass_maximum: float = 100.0
 
 
 class GWPopulationMassSampler:
-    """Adapter: gwpopulation evaluates the mass PDF, popsampler draws samples."""
+    """Adapter: gwpopulation evaluates primary components; popsampler samples."""
 
     def __init__(self, config: GWPopulationMassSamplerConfig | None = None):
         self.config = GWPopulationMassSamplerConfig() if config is None else config
@@ -52,12 +54,11 @@ class GWPopulationMassSampler:
                 "Could not import gwpopulation.models.mass. Install with `python -m pip install -e '.[gwtc4]'`."
             ) from exc
         self.gwpop_mass = gwpop_mass
-        self._model: Any | None = None
-        self._model_name: str | None = None
+        self._model_name = CANDIDATE_CLASS_NAMES[0]
 
     @property
     def model_name(self) -> str:
-        return self._model_name or "undiscovered_gwpopulation_mass_model"
+        return self._model_name
 
     def sample(self, row: Mapping[str, float], n: int, *, rng: np.random.Generator) -> dict[str, np.ndarray]:
         m1_grid = np.linspace(self.config.m1_min, self.config.m1_max, self.config.mass_grid_size)
@@ -72,24 +73,18 @@ class GWPopulationMassSampler:
             "mass_ratio": q,
             "chirp_mass_source": chirp,
             "total_mass_source": m1 + m2,
-            "mass_sampler_backend": np.full(n, "gwpopulation", dtype=object),
+            "mass_sampler_backend": np.full(n, "gwpopulation_primary_asymmetric_q", dtype=object),
             "gwpopulation_mass_model": np.full(n, self.model_name, dtype=object),
         }
 
     def marginal_mass_1_pdf(self, row: Mapping[str, float], mass_1: np.ndarray) -> np.ndarray:
-        q_grid = np.linspace(self.config.q_min, self.config.q_max, self.config.q_grid_size)
-        m1_mesh, q_mesh = np.meshgrid(np.asarray(mass_1, dtype=float), q_grid, indexing="ij")
-        joint = self.evaluate_joint(row, m1_mesh.ravel(), q_mesh.ravel()).reshape(m1_mesh.shape)
-        return np.trapz(np.clip(joint, 0.0, np.inf), q_grid, axis=1)
+        return self.primary_mass_pdf(row, np.asarray(mass_1, dtype=float))
 
     def sample_mass_ratio_conditional(self, row: Mapping[str, float], mass_1: np.ndarray, *, rng: np.random.Generator) -> np.ndarray:
         mass_1 = np.asarray(mass_1, dtype=float)
         q_grid = np.linspace(self.config.q_min, self.config.q_max, self.config.q_grid_size)
-        m1_mesh = np.repeat(mass_1[:, None], len(q_grid), axis=1)
-        q_mesh = np.repeat(q_grid[None, :], len(mass_1), axis=0)
-        joint = self.evaluate_joint(row, m1_mesh.ravel(), q_mesh.ravel()).reshape(m1_mesh.shape)
-        joint = np.clip(joint, 0.0, np.inf)
-        cdf = np.cumsum(joint, axis=1)
+        pdf = self.conditional_mass_ratio_pdf(row, mass_1, q_grid)
+        cdf = np.cumsum(pdf, axis=1)
         totals = cdf[:, -1]
         q = np.empty(len(mass_1), dtype=float)
         good = np.isfinite(totals) & (totals > 0)
@@ -99,105 +94,79 @@ class GWPopulationMassSampler:
             idx = np.array([np.searchsorted(cdf_good[i], u[i], side="left") for i in range(len(u))])
             q[good] = q_grid[np.clip(idx, 0, len(q_grid) - 1)]
         if np.any(~good):
-            q[~good] = self.config.q_min
+            q[~good] = np.maximum(self.config.q_min, float(row["mlow_2"]) / mass_1[~good])
+            q[~good] = np.clip(q[~good], self.config.q_min, self.config.q_max)
         return q
 
     def evaluate_joint(self, row: Mapping[str, float], mass_1: np.ndarray, mass_ratio: np.ndarray) -> np.ndarray:
-        model = self._ensure_model(row)
-        values = model(self._dataset(mass_1, mass_ratio), **self._row_to_kwargs(row))
-        return np.clip(np.asarray(values, dtype=float).reshape(np.asarray(mass_1).shape), 0.0, np.inf)
+        mass_1 = np.asarray(mass_1, dtype=float)
+        mass_ratio = np.asarray(mass_ratio, dtype=float)
+        p_m1 = self.primary_mass_pdf(row, mass_1)
+        p_q = self.conditional_mass_ratio_pdf(row, mass_1, mass_ratio)
+        return np.clip(p_m1 * p_q, 0.0, np.inf)
 
-    def _ensure_model(self, row: Mapping[str, float]) -> Any:
-        row_mmax = max(float(row.get("mmax", self.config.m1_max)), self.config.m1_max)
-        if self._model is not None:
-            if getattr(self._model, "mmax", row_mmax) >= row_mmax:
-                return self._model
-            self._model = None
-            self._model_name = None
+    def primary_mass_pdf(self, row: Mapping[str, float], mass_1: np.ndarray) -> np.ndarray:
+        mass_1 = np.asarray(mass_1, dtype=float)
+        kwargs = self._primary_kwargs(row)
+        mmin = kwargs["mmin"]
+        mmax = kwargs["mmax"]
+        delta_m = float(row["delta_m_1"])
+        smooth = self._low_mass_smoothing(mass_1, mmin, delta_m, high=mmax)
 
-        cls = self._build_broken_power_law_two_peak_class()
-        try:
-            self._model = cls(
-                mmin=self.config.m1_min,
-                mmax=row_mmax,
-                normalization_shape=(self.config.mass_grid_size, self.config.q_grid_size),
-            )
-            self._model_name = cls.__name__
-            test = self._model(
-                self._dataset(np.array([20.0, 40.0]), np.array([0.8, 0.5])),
-                **self._row_to_kwargs(row),
-            )
-            if not (np.all(np.isfinite(test)) and np.any(np.asarray(test) > 0)):
-                raise GWPopulationMassModelError(f"non-positive/non-finite smoke-test values {test}")
-            return self._model
-        except Exception as exc:
-            raise GWPopulationMassModelError(
-                "Could not instantiate/evaluate the gwpopulation-backed GWTC-4 broken-power-law two-peak model: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
+        continuum = self.gwpop_mass.double_power_law_primary_mass(
+            mass_1,
+            alpha_1=kwargs["alpha_1"],
+            alpha_2=kwargs["alpha_2"],
+            mmin=mmin,
+            mmax=mmax,
+            break_fraction=kwargs["break_fraction"],
+        ) * smooth
+        lower_peak = self._normal_component(
+            mass_1,
+            mu=kwargs["mpp_1"],
+            sigma=kwargs["sigpp_1"],
+            low=mmin,
+            high=self.config.gaussian_mass_maximum,
+        ) * smooth
+        upper_peak = self._normal_component(
+            mass_1,
+            mu=kwargs["mpp_2"],
+            sigma=kwargs["sigpp_2"],
+            low=mmin,
+            high=self.config.gaussian_mass_maximum,
+        ) * smooth
 
-    def _build_broken_power_law_two_peak_class(self):
-        mass = self.gwpop_mass
+        continuum = self._trapz_normalize(mass_1, continuum)
+        lower_peak = self._trapz_normalize(mass_1, lower_peak)
+        upper_peak = self._trapz_normalize(mass_1, upper_peak)
+        lam = float(np.clip(row["lam_0"], 0.0, 1.0))
+        lam_1 = float(np.clip(row["lam_1"], 0.0, 1.0))
+        pdf = (1.0 - lam) * continuum + lam * (lam_1 * lower_peak + (1.0 - lam_1) * upper_peak)
+        return self._trapz_normalize(mass_1, pdf)
 
-        def broken_power_law_two_peak_primary_mass(
-            mass_array,
-            alpha_1,
-            alpha_2,
-            mmin,
-            mmax,
-            break_fraction,
-            lam,
-            lam_1,
-            mpp_1,
-            mpp_2,
-            sigpp_1,
-            sigpp_2,
-            gaussian_mass_maximum=100,
-        ):
-            continuum = mass.double_power_law_primary_mass(
-                mass_array,
-                alpha_1=alpha_1,
-                alpha_2=alpha_2,
-                mmin=mmin,
-                mmax=mmax,
-                break_fraction=break_fraction,
-            )
-            lower_peak = mass.double_power_law_peak_primary_mass(
-                mass_array,
-                alpha_1=alpha_1,
-                alpha_2=alpha_2,
-                mmin=mmin,
-                mmax=mmax,
-                break_fraction=break_fraction,
-                lam=1.0,
-                mpp=mpp_1,
-                sigpp=sigpp_1,
-                gaussian_mass_maximum=gaussian_mass_maximum,
-            )
-            upper_peak = mass.double_power_law_peak_primary_mass(
-                mass_array,
-                alpha_1=alpha_1,
-                alpha_2=alpha_2,
-                mmin=mmin,
-                mmax=mmax,
-                break_fraction=break_fraction,
-                lam=1.0,
-                mpp=mpp_2,
-                sigpp=sigpp_2,
-                gaussian_mass_maximum=gaussian_mass_maximum,
-            )
-            lam = float(np.clip(lam, 0.0, 1.0))
-            lam_1 = float(np.clip(lam_1, 0.0, 1.0))
-            return (1.0 - lam) * continuum + lam * (lam_1 * lower_peak + (1.0 - lam_1) * upper_peak)
-
-        class GWTC4BrokenPowerLawTwoPeaksSmoothedMassDistribution(mass.BaseSmoothedMassDistribution):
-            primary_model = staticmethod(broken_power_law_two_peak_primary_mass)
-
-            @property
-            def kwargs(self):
-                return dict(gaussian_mass_maximum=self.mmax)
-
-        return GWTC4BrokenPowerLawTwoPeaksSmoothedMassDistribution
+    def conditional_mass_ratio_pdf(self, row: Mapping[str, float], mass_1: np.ndarray, mass_ratio: np.ndarray) -> np.ndarray:
+        mass_1 = np.asarray(mass_1, dtype=float)
+        mass_ratio = np.asarray(mass_ratio, dtype=float)
+        if mass_ratio.ndim == 1 and mass_1.ndim == 1 and len(mass_ratio) != len(mass_1):
+            q = np.repeat(mass_ratio[None, :], len(mass_1), axis=0)
+            m1 = np.repeat(mass_1[:, None], len(mass_ratio), axis=1)
+        else:
+            q = mass_ratio
+            m1 = mass_1
+        beta = float(row["beta"])
+        mlow_2 = float(row["mlow_2"])
+        delta_m_2 = float(row["delta_m_2"])
+        m2 = q * m1
+        pdf = np.power(np.maximum(q, 1e-300), beta)
+        pdf *= self._low_mass_smoothing(m2, mlow_2, delta_m_2, high=m1)
+        pdf = np.where((q > 0.0) & (q <= 1.0) & (m2 <= m1), pdf, 0.0)
+        if pdf.ndim == 2:
+            norms = np.trapz(pdf, mass_ratio, axis=1)
+            good = np.isfinite(norms) & (norms > 0)
+            out = np.zeros_like(pdf)
+            out[good] = pdf[good] / norms[good, None]
+            return out
+        return np.clip(pdf, 0.0, np.inf)
 
     @staticmethod
     def _dataset(mass_1: np.ndarray, mass_ratio: np.ndarray) -> dict[str, np.ndarray]:
@@ -206,7 +175,7 @@ class GWPopulationMassSampler:
         return {"mass_1": mass_1, "mass_ratio": mass_ratio, "mass_2": mass_1 * mass_ratio}
 
     @staticmethod
-    def _row_to_kwargs(row: Mapping[str, float]) -> dict[str, float]:
+    def _primary_kwargs(row: Mapping[str, float]) -> dict[str, float]:
         mmin = float(row["mlow_1"])
         mmax = float(row["mmax"])
         break_mass = float(row["break_mass"])
@@ -217,15 +186,40 @@ class GWPopulationMassSampler:
         return {
             "alpha_1": float(row["alpha_1"]),
             "alpha_2": float(row["alpha_2"]),
-            "beta": float(row["beta"]),
             "mmin": mmin,
             "mmax": mmax,
             "break_fraction": float(np.clip(break_fraction, 0.0, 1.0)),
-            "lam": float(row["lam_0"]),
-            "lam_1": float(row["lam_1"]),
             "mpp_1": float(row["mpp_1"]),
             "mpp_2": float(row["mpp_2"]),
             "sigpp_1": float(row["sigpp_1"]),
             "sigpp_2": float(row["sigpp_2"]),
-            "delta_m": float(row["delta_m_1"]),
         }
+
+    @staticmethod
+    def _normal_component(x: np.ndarray, *, mu: float, sigma: float, low: float, high: float) -> np.ndarray:
+        sigma = max(float(sigma), 1e-12)
+        y = np.exp(-0.5 * ((np.asarray(x) - float(mu)) / sigma) ** 2) / sigma
+        return np.where((x >= low) & (x <= high), y, 0.0)
+
+    @staticmethod
+    def _low_mass_smoothing(x: np.ndarray, low: float, delta_m: float, high: float | np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        high = np.asarray(high, dtype=float)
+        if delta_m <= 0:
+            return np.where((x >= low) & (x <= high), 1.0, 0.0)
+        y = (x - low) / delta_m
+        out = np.zeros_like(x, dtype=float)
+        out[y >= 1.0] = 1.0
+        mask = (y > 0.0) & (y < 1.0)
+        y_clip = np.clip(y[mask], 1e-12, 1.0 - 1e-12)
+        exponent = 1.0 / y_clip + 1.0 / (y_clip - 1.0)
+        out[mask] = 1.0 / (np.exp(exponent) + 1.0)
+        return np.where(x <= high, out, 0.0)
+
+    @staticmethod
+    def _trapz_normalize(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        y = np.clip(np.asarray(y, dtype=float), 0.0, np.inf)
+        norm = np.trapz(y, x)
+        if not np.isfinite(norm) or norm <= 0:
+            raise GWPopulationMassModelError(f"Cannot normalize mass PDF: integral={norm}")
+        return y / norm
