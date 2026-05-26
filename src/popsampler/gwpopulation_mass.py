@@ -129,7 +129,7 @@ class GWPopulationMassSampler:
         available = [name for name in CANDIDATE_CLASS_NAMES if hasattr(self.gwpop_mass, name)]
         raise GWPopulationMassModelError(
             "Could not find a usable gwpopulation mass model. "
-            f"Available candidates: {available}. Attempts:\n" + "\n".join(errors[:20])
+            f"Available candidates: {available}. Attempts:\n" + "\n".join(errors[:30])
         )
 
     @staticmethod
@@ -151,9 +151,17 @@ class GWPopulationMassSampler:
         return out
 
     def _call_model(self, model: Any, dataset: dict[str, np.ndarray], kwargs: dict[str, float]) -> np.ndarray:
+        # Some gwpopulation callables expect hyperparameters as keyword arguments;
+        # some helper functions/classes read them directly from the data dict.
+        dataset_with_params = dict(dataset)
+        dataset_with_params.update(kwargs)
+        filtered_kwargs = self._filter_kwargs(model, kwargs)
         attempts = (
             lambda: model(dataset, **kwargs),
-            lambda: model(dataset, **self._filter_kwargs(model, kwargs)),
+            lambda: model(dataset_with_params),
+            lambda: model(dataset_with_params, **kwargs),
+            lambda: model(dataset, **filtered_kwargs),
+            lambda: model(dataset_with_params, **self._filter_kwargs(model, kwargs)),
             lambda: model(dataset, kwargs),
         )
         last_exc: Exception | None = None
