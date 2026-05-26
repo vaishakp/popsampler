@@ -4,9 +4,17 @@ The public gwpopulation 1.3.1 release provides the authoritative primary-mass
 component functions for LVK-style broken-power-law and Gaussian-peak models, but
 it does not expose a ready-made GWTC-4 two-peak class with separate primary and
 secondary low-mass smoothing scales. This module therefore uses gwpopulation for
-the primary-mass components and implements the asymmetric conditional
-``p(q | mass_1)`` layer needed by the GWTC-4 parameter names ``mlow_2`` and
-``delta_m_2``.
+the primary broken-power-law component and implements the released-grid-matched
+GWTC-4 conventions identified by deterministic validation:
+
+* effective primary power-law/peak support fixed at 100 Msun;
+* lam_0 and lam_1 treated as absolute lower/upper peak weights;
+* Gaussian peaks are not multiplied by the low-mass smoothing window;
+* the primary density is reweighted by mass_1**(-1.5) before normalization.
+
+The final item is an empirical density-coordinate convention inferred by direct
+comparison to the released GWTC-4 mass_1 grids; keep it explicit rather than
+burying it in the power-law parameters.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ class GWPopulationMassSamplerConfig:
     mass_grid_size: int = 1200
     q_grid_size: int = 500
     gaussian_mass_maximum: float = 100.0
+    primary_density_jacobian_power: float = -1.5
 
 
 class GWPopulationMassSampler:
@@ -75,6 +84,7 @@ class GWPopulationMassSampler:
             "total_mass_source": m1 + m2,
             "mass_sampler_backend": np.full(n, "gwpopulation_primary_asymmetric_q", dtype=object),
             "gwpopulation_mass_model": np.full(n, self.model_name, dtype=object),
+            "primary_density_jacobian_power": np.full(n, self.config.primary_density_jacobian_power),
         }
 
     def marginal_mass_1_pdf(self, row: Mapping[str, float], mass_1: np.ndarray) -> np.ndarray:
@@ -131,21 +141,21 @@ class GWPopulationMassSampler:
             sigma=kwargs["sigpp_1"],
             low=mmin,
             high=self.config.gaussian_mass_maximum,
-        ) * smooth
+        )
         upper_peak = self._normal_component(
             mass_1,
             mu=kwargs["mpp_2"],
             sigma=kwargs["sigpp_2"],
             low=mmin,
             high=self.config.gaussian_mass_maximum,
-        ) * smooth
+        )
 
         continuum = self._trapz_normalize(mass_1, continuum)
         lower_peak = self._trapz_normalize(mass_1, lower_peak)
         upper_peak = self._trapz_normalize(mass_1, upper_peak)
-        lam = float(np.clip(row["lam_0"], 0.0, 1.0))
-        lam_1 = float(np.clip(row["lam_1"], 0.0, 1.0))
-        pdf = (1.0 - lam) * continuum + lam * (lam_1 * lower_peak + (1.0 - lam_1) * upper_peak)
+        w_cont, w_lower, w_upper = self._absolute_peak_weights(row)
+        pdf = w_cont * continuum + w_lower * lower_peak + w_upper * upper_peak
+        pdf *= np.power(np.maximum(mass_1, 1e-300), self.config.primary_density_jacobian_power)
         return self._trapz_normalize(mass_1, pdf)
 
     def conditional_mass_ratio_pdf(
@@ -178,7 +188,7 @@ class GWPopulationMassSampler:
         pdf = np.where((q > 0.0) & (q <= 1.0) & (m2 <= m1), pdf, 0.0)
         if pairwise:
             return np.clip(pdf, 0.0, np.inf)
-        norms = np.trapz(pdf, q_axis, axis=1)
+        norms = np.trapezoid(pdf, q_axis, axis=1)
         good = np.isfinite(norms) & (norms > 0)
         out = np.zeros_like(pdf)
         out[good] = pdf[good] / norms[good, None]
@@ -190,10 +200,9 @@ class GWPopulationMassSampler:
         mass_ratio = np.asarray(mass_ratio, dtype=float)
         return {"mass_1": mass_1, "mass_ratio": mass_ratio, "mass_2": mass_1 * mass_ratio}
 
-    @staticmethod
-    def _primary_kwargs(row: Mapping[str, float]) -> dict[str, float]:
+    def _primary_kwargs(self, row: Mapping[str, float]) -> dict[str, float]:
         mmin = float(row["mlow_1"])
-        mmax = float(row["mmax"])
+        mmax = float(self.config.gaussian_mass_maximum)
         break_mass = float(row["break_mass"])
         if 0.0 < break_mass < 1.0:
             break_fraction = break_mass
@@ -210,6 +219,17 @@ class GWPopulationMassSampler:
             "sigpp_1": float(row["sigpp_1"]),
             "sigpp_2": float(row["sigpp_2"]),
         }
+
+    @staticmethod
+    def _absolute_peak_weights(row: Mapping[str, float]) -> tuple[float, float, float]:
+        lam_0 = float(np.clip(row["lam_0"], 0.0, 1.0))
+        lam_1 = float(np.clip(row["lam_1"], 0.0, 1.0))
+        weights = np.array([max(0.0, 1.0 - lam_0 - lam_1), lam_0, lam_1], dtype=float)
+        total = float(np.sum(weights))
+        if not np.isfinite(total) or total <= 0.0:
+            return (1.0, 0.0, 0.0)
+        weights /= total
+        return (float(weights[0]), float(weights[1]), float(weights[2]))
 
     @staticmethod
     def _normal_component(x: np.ndarray, *, mu: float, sigma: float, low: float, high: float) -> np.ndarray:
@@ -235,7 +255,7 @@ class GWPopulationMassSampler:
     @staticmethod
     def _trapz_normalize(x: np.ndarray, y: np.ndarray) -> np.ndarray:
         y = np.clip(np.asarray(y, dtype=float), 0.0, np.inf)
-        norm = np.trapz(y, x)
+        norm = np.trapezoid(y, x)
         if not np.isfinite(norm) or norm <= 0:
             raise GWPopulationMassModelError(f"Cannot normalize mass PDF: integral={norm}")
         return y / norm
