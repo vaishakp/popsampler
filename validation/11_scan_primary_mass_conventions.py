@@ -11,7 +11,9 @@ power-law mass model:
 * effective power-law mmax: row mmax, fixed 100, or the released grid maximum;
 * Gaussian peak support: fixed 100, effective mmax, or grid maximum;
 * peak weights: lam_0 as total Gaussian fraction vs absolute lam_0/lam_1;
-* whether the primary low-mass smoothing also multiplies Gaussian peaks.
+* whether the primary low-mass smoothing also multiplies Gaussian peaks;
+* an explicit density-Jacobian power, i.e. multiply the model density by
+  mass_1**jacobian_power before normalization.
 
 The target is the equal-row average of per-row normalized released rate grids,
 which matches validation runs with fixed events_per_row.
@@ -37,6 +39,7 @@ class PrimaryMassConvention:
     peak_high_mode: str
     lambda_mode: str
     smooth_peaks: bool
+    jacobian_power: float
 
 
 def trapz_normalize(x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -152,7 +155,10 @@ def primary_pdf(x: np.ndarray, row: pd.Series, convention: PrimaryMassConvention
     lower_peak = trapz_normalize(x, lower_peak)
     upper_peak = trapz_normalize(x, upper_peak)
     w_cont, w_low, w_high = resolve_weights(row, convention.lambda_mode)
-    return trapz_normalize(x, w_cont * continuum + w_low * lower_peak + w_high * upper_peak)
+    pdf = w_cont * continuum + w_low * lower_peak + w_high * upper_peak
+    if convention.jacobian_power != 0.0:
+        pdf = pdf * np.power(np.maximum(x, 1e-300), convention.jacobian_power)
+    return trapz_normalize(x, pdf)
 
 
 def target_pdf(x: np.ndarray, rates: np.ndarray) -> np.ndarray:
@@ -176,16 +182,19 @@ def weighted_quantile(x: np.ndarray, pdf: np.ndarray, q: float) -> float:
 def summarize(x: np.ndarray, estimate: np.ndarray, target: np.ndarray, convention: PrimaryMassConvention) -> dict[str, float | str | bool]:
     estimate = trapz_normalize(x, estimate)
     target = trapz_normalize(x, target)
+    estimate_mean = float(np.trapezoid(x * estimate, x))
+    target_mean = float(np.trapezoid(x * target, x))
     return {
         "convention": convention.name,
         "mmax_mode": convention.mmax_mode,
         "peak_high_mode": convention.peak_high_mode,
         "lambda_mode": convention.lambda_mode,
         "smooth_peaks": convention.smooth_peaks,
+        "jacobian_power": convention.jacobian_power,
         "l1": float(np.trapezoid(np.abs(estimate - target), x)),
-        "estimate_mean": float(np.trapezoid(x * estimate, x)),
-        "target_mean": float(np.trapezoid(x * target, x)),
-        "mean_abs_diff": float(abs(np.trapezoid(x * estimate, x) - np.trapezoid(x * target, x))),
+        "estimate_mean": estimate_mean,
+        "target_mean": target_mean,
+        "mean_abs_diff": float(abs(estimate_mean - target_mean)),
         "estimate_q05": weighted_quantile(x, estimate, 0.05),
         "target_q05": weighted_quantile(x, target, 0.05),
         "estimate_q50": weighted_quantile(x, estimate, 0.50),
@@ -197,6 +206,9 @@ def summarize(x: np.ndarray, estimate: np.ndarray, target: np.ndarray, conventio
 
 def build_conventions() -> list[PrimaryMassConvention]:
     conventions = []
+    # Include physically interpretable powers and a fine grid around the empirical
+    # region where the uploaded convention scan indicated the released grid lives.
+    jacobian_powers = sorted(set([-2.0, -1.5, -1.25, -1.0, -0.5, 0.0]))
     for mmax_mode in ["row_mmax", "fixed_100", "grid_max"]:
         for peak_high_mode in ["fixed_100", "effective_mmax", "grid_max"]:
             for lambda_mode in [
@@ -206,16 +218,21 @@ def build_conventions() -> list[PrimaryMassConvention]:
                 "absolute_lam0_lam1",
             ]:
                 for smooth_peaks in [True, False]:
-                    name = f"{mmax_mode}__{peak_high_mode}__{lambda_mode}__smooth{int(smooth_peaks)}"
-                    conventions.append(
-                        PrimaryMassConvention(
-                            name=name,
-                            mmax_mode=mmax_mode,
-                            peak_high_mode=peak_high_mode,
-                            lambda_mode=lambda_mode,
-                            smooth_peaks=smooth_peaks,
+                    for jacobian_power in jacobian_powers:
+                        name = (
+                            f"{mmax_mode}__{peak_high_mode}__{lambda_mode}__"
+                            f"smooth{int(smooth_peaks)}__jac{jacobian_power:g}"
                         )
-                    )
+                        conventions.append(
+                            PrimaryMassConvention(
+                                name=name,
+                                mmax_mode=mmax_mode,
+                                peak_high_mode=peak_high_mode,
+                                lambda_mode=lambda_mode,
+                                smooth_peaks=smooth_peaks,
+                                jacobian_power=jacobian_power,
+                            )
+                        )
     return conventions
 
 
@@ -266,6 +283,8 @@ def main() -> None:
     print(f"wrote {summary_path}")
     print(f"wrote {curves_path}")
     print(summary.head(20).to_string(index=False))
+    print("\nBest by L1:")
+    print(summary.sort_values(["l1", "mean_abs_diff"]).head(20).to_string(index=False))
 
 
 if __name__ == "__main__":
