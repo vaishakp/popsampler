@@ -20,10 +20,11 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from .cosmology import DEFAULT_COSMOLOGY, luminosity_distance_from_redshift, power_law_redshift_pdf
+from .cosmology import DEFAULT_COSMOLOGY, luminosity_distance_from_redshift
 from .extrinsics import sample_isotropic_extrinsics
 from .gwpopulation_mass import GWPopulationMassSampler, GWPopulationMassSamplerConfig
 from .redshift_evolution import RedshiftEvolutionConfig
+from .redshift_models import RedshiftRateConfig, redshift_pdf
 from .samplers import InverseCDFSampler
 
 
@@ -50,7 +51,7 @@ def _trapz_normalize(x: np.ndarray, y: np.ndarray, *, label: str) -> np.ndarray:
 
 @dataclass
 class BBHDefaultModelConfig:
-    """Numerical settings for the GWTC-4 default BBH sampler."""
+    """Numerical settings for BBH posterior-predictive samplers."""
 
     m1_min: float = 2.0
     m1_max: float = 300.0
@@ -65,6 +66,7 @@ class BBHDefaultModelConfig:
     cosmology: object = field(default_factory=lambda: DEFAULT_COSMOLOGY)
     warn_if_unvalidated: bool = True
     redshift_evolution: RedshiftEvolutionConfig = field(default_factory=RedshiftEvolutionConfig.disabled)
+    redshift_rate: RedshiftRateConfig = field(default_factory=RedshiftRateConfig)
 
 
 class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
@@ -104,8 +106,7 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
         "sigpp_2",
     )
     SPIN_PARAMETERS = ("mu_chi", "sigma_chi", "mu_spin", "sigma_spin", "xi_spin")
-    REDSHIFT_PARAMETERS = ("lamb",)
-    REQUIRED_PARAMETERS = MASS_PARAMETERS + SPIN_PARAMETERS + REDSHIFT_PARAMETERS
+    REQUIRED_PARAMETERS = MASS_PARAMETERS + SPIN_PARAMETERS
 
     def __init__(self, config: BBHDefaultModelConfig | None = None):
         self.config = BBHDefaultModelConfig() if config is None else config
@@ -125,6 +126,10 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
     def redshift_evolution(self) -> RedshiftEvolutionConfig:
         return self.config.redshift_evolution
 
+    @property
+    def redshift_rate(self) -> RedshiftRateConfig:
+        return self.config.redshift_rate
+
     def validate_hyperparameters(self, row: Mapping[str, float]) -> None:
         missing = [name for name in self.REQUIRED_PARAMETERS if name not in row or pd.isna(row[name])]
         if missing:
@@ -132,6 +137,7 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
         for name in self.REQUIRED_PARAMETERS:
             _required(row, name)
         self._validate_physical_constraints(row)
+        self.redshift_rate.validate(row)
         self.redshift_evolution.validate(row)
 
     def _validate_physical_constraints(self, row: Mapping[str, float]) -> None:
@@ -204,6 +210,7 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
             # Evolution can push parameters outside their physical support; catch
             # that per event rather than silently clipping everything.
             self._validate_physical_constraints(evolved_row)
+            self.redshift_rate.validate(evolved_row)
             out: dict[str, np.ndarray] = {
                 "redshift": np.asarray([z], dtype=float),
                 "luminosity_distance": np.asarray([z_block["luminosity_distance"][i]], dtype=float),
@@ -231,6 +238,7 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
         df["joint_sampler_validation_status"] = "requires_rates_on_grids_validation"
         df["redshift_evolution_applied"] = bool(redshift_evolution_applied)
         df["redshift_evolution_spec"] = self.redshift_evolution.describe()
+        df["redshift_rate_model"] = self.redshift_rate.describe()
 
     def sample_masses(
         self,
@@ -249,9 +257,8 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
         *,
         rng: np.random.Generator,
     ) -> dict[str, np.ndarray]:
-        lamb = _required(row, "lamb")
         z_grid = np.linspace(self.config.z_min, self.config.z_max, self.config.z_grid_size)
-        pdf = power_law_redshift_pdf(z_grid, lamb=lamb, cosmology=self.config.cosmology)
+        pdf = redshift_pdf(z_grid, row, self.redshift_rate, cosmology=self.config.cosmology)
         z = InverseCDFSampler.from_pdf(z_grid, pdf).sample(n, rng)
         return {"redshift": z, "luminosity_distance": luminosity_distance_from_redshift(z, self.config.cosmology)}
 
