@@ -24,6 +24,12 @@ m1_max = 100.0
 mass_grid_size = 333
 q_grid_size = 111
 
+[redshift]
+model = madau_dickinson
+madau_alpha = 2.7
+madau_beta = 2.9
+madau_z_peak = 1.9
+
 [redshift_evolution]
 enabled = true
 reference_z = 0.5
@@ -39,5 +45,9 @@ xi_spin = linear_z, gamma_xi_spin, 0, 1
     assert out.include_extrinsics is False
     assert out.model_config.m1_max == 100.0
     assert out.model_config.mass_grid_size == 333
+    assert out.model_config.redshift_rate.model == "madau_dickinson"
+    assert out.model_config.redshift_rate.madau_alpha == 2.7
+    assert out.model_config.redshift_rate.madau_beta == 2.9
+    assert out.model_config.redshift_rate.madau_z_peak == 1.9
     assert out.model_config.redshift_evolution.active
     assert len(out.model_config.redshift_evolution.parameter_evolutions) == 2
