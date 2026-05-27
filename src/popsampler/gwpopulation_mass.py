@@ -1,17 +1,18 @@
 """Use the paper-defined GWTC-4 BBH mass convention for posterior-predictive draws.
 
 Appendix B.3 of the GWTC-4.0 population paper defines the fiducial BBH
-Broken Power Law + 2 Peaks model as
+Broken Power Law + 2 Peaks model as a broken-power-law continuum plus two
+left-truncated Gaussian peaks, with low-mass Planck tapering applied to the full
+primary-mass mixture:
 
-    [lambda0 * p_BP(m1) + lambda1 * N_lt(mu1, sigma1)
-     + (1 - lambda0 - lambda1) * N_lt(mu2, sigma2)] * S(m1),
+    [(1 - lambda_0) * p_BP(m1)
+     + lambda_0 * lambda_1 * N_lt(mu1, sigma1)
+     + lambda_0 * (1 - lambda_1) * N_lt(mu2, sigma2)] * S(m1).
 
-with p_BP proportional to (m1 / m_break)^(-alpha_i), a common Planck taper
-S(m1 | m1_low, delta_m1) applied to the full primary-mass mixture, m_high=300
-Msun, and p(q | m1) proportional to q^beta S(m1*q | m2_low, delta_m2).
-
-This file deliberately keeps that paper convention explicit. In particular, it
-removes the earlier released-grid-fitting mass_1**(-1.5) empirical factor.
+Here ``lambda_0`` is the total fraction in the two Gaussian peak components and
+``lambda_1`` is the fraction of the Gaussian component in the lower-mass peak.
+The conditional mass-ratio model is proportional to
+``q**beta * S(m1*q | m2_low, delta_m2)`` and is normalized for each primary mass.
 """
 
 from __future__ import annotations
@@ -84,7 +85,9 @@ class GWPopulationMassSampler:
     def marginal_mass_1_pdf(self, row: Mapping[str, float], mass_1: np.ndarray) -> np.ndarray:
         return self.primary_mass_pdf(row, np.asarray(mass_1, dtype=float))
 
-    def sample_mass_ratio_conditional(self, row: Mapping[str, float], mass_1: np.ndarray, *, rng: np.random.Generator) -> np.ndarray:
+    def sample_mass_ratio_conditional(
+        self, row: Mapping[str, float], mass_1: np.ndarray, *, rng: np.random.Generator
+    ) -> np.ndarray:
         mass_1 = np.asarray(mass_1, dtype=float)
         q_grid = np.linspace(self.config.q_min, self.config.q_max, self.config.q_grid_size)
         pdf = self.conditional_mass_ratio_pdf(row, mass_1, q_grid, pairwise=False)
@@ -212,9 +215,16 @@ class GWPopulationMassSampler:
 
     @staticmethod
     def _paper_mixture_weights(row: Mapping[str, float]) -> tuple[float, float, float]:
+        """Return continuum, lower-peak, upper-peak mixture weights.
+
+        GWPopulation's two-peak convention is
+        ``(1 - lam_0, lam_0 * lam_1, lam_0 * (1 - lam_1))`` where ``lam_0`` is
+        the total Gaussian-peak fraction and ``lam_1`` is the lower-peak fraction
+        within that Gaussian subpopulation.
+        """
         lam_0 = float(np.clip(row["lam_0"], 0.0, 1.0))
         lam_1 = float(np.clip(row["lam_1"], 0.0, 1.0))
-        weights = np.array([lam_0, lam_1, max(0.0, 1.0 - lam_0 - lam_1)], dtype=float)
+        weights = np.array([1.0 - lam_0, lam_0 * lam_1, lam_0 * (1.0 - lam_1)], dtype=float)
         total = float(np.sum(weights))
         if not np.isfinite(total) or total <= 0.0:
             return (1.0, 0.0, 0.0)
