@@ -1,0 +1,53 @@
+name: Inspect GWTC-4 HDF5 metadata
+
+on:
+  workflow_dispatch:
+    inputs:
+      record_id:
+        description: Zenodo record id
+        required: true
+        default: "16911563"
+      tarball:
+        description: Zenodo tarball to stream
+        required: true
+        default: analyses_BBH.tar
+      h5_basename:
+        description: HDF5 basename to extract from the tar stream
+        required: true
+        default: BBHMassSpinRedshift_BrokenPowerLawTwoPeaks_GaussianComponentSpins_PowerLawRedshift.h5
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: initial-gwtc4-sampler
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[gwtc4,parquet,dev]'
+
+      - name: Stream extract and inspect HDF5
+        run: |
+          python validation/06_stream_zenodo_extract_inspect.py \
+            --record-id "${{ inputs.record_id }}" \
+            --tarball "${{ inputs.tarball }}" \
+            --h5-basename "${{ inputs.h5_basename }}" \
+            --workdir runner_h5_work \
+            --outdir runner_h5_report
+
+      - name: Upload compact metadata report
+        uses: actions/upload-artifact@v4
+        with:
+          name: gwtc4-h5-metadata-report
+          path: runner_h5_report/
+          if-no-files-found: error
