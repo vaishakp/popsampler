@@ -9,6 +9,7 @@ from typing import Any
 
 from .models import BBHDefaultModelConfig
 from .redshift_evolution import ParameterEvolution, RedshiftEvolutionConfig
+from .redshift_models import RedshiftRateConfig
 
 
 @dataclass(frozen=True)
@@ -28,8 +29,8 @@ class SamplerRunConfig:
 def read_sampler_config(path: str | Path) -> SamplerRunConfig:
     """Read an INI-style sampler config.
 
-    Supported sections are ``[run]``, ``[model]``, ``[grid]``, and
-    ``[redshift_evolution]``. Command-line arguments can still override the
+    Supported sections are ``[run]``, ``[model]``, ``[grid]``, ``[redshift]``,
+    and ``[redshift_evolution]``. Command-line arguments can still override the
     returned values in the CLI layer.
     """
 
@@ -43,8 +44,10 @@ def read_sampler_config(path: str | Path) -> SamplerRunConfig:
     model = parser["model"] if parser.has_section("model") else {}
     grid = parser["grid"] if parser.has_section("grid") else {}
     redshift = parser["redshift_evolution"] if parser.has_section("redshift_evolution") else {}
+    redshift_rate = parser["redshift"] if parser.has_section("redshift") else {}
 
     evolution_config = _parse_redshift_evolution(redshift)
+    redshift_rate_config = _parse_redshift_rate(redshift_rate)
     model_config = BBHDefaultModelConfig(
         m1_min=_get_float(grid, "m1_min", BBHDefaultModelConfig.m1_min),
         m1_max=_get_float(grid, "m1_max", BBHDefaultModelConfig.m1_max),
@@ -58,6 +61,7 @@ def read_sampler_config(path: str | Path) -> SamplerRunConfig:
         spin_grid_size=_get_int(grid, "spin_grid_size", BBHDefaultModelConfig.spin_grid_size),
         warn_if_unvalidated=_get_bool(model, "warn_if_unvalidated", True),
         redshift_evolution=evolution_config,
+        redshift_rate=redshift_rate_config,
     )
 
     return SamplerRunConfig(
@@ -103,6 +107,7 @@ def merge_cli_config(
             spin_grid_size=model_config.spin_grid_size,
             cosmology=model_config.cosmology,
             warn_if_unvalidated=model_config.warn_if_unvalidated,
+            redshift_rate=model_config.redshift_rate,
             redshift_evolution=RedshiftEvolutionConfig(
                 enabled=True,
                 parameter_evolutions=redshift_evolutions,
@@ -165,7 +170,25 @@ def _replace_redshift_reference(config: BBHDefaultModelConfig, reference_z: floa
         spin_grid_size=config.spin_grid_size,
         cosmology=config.cosmology,
         warn_if_unvalidated=config.warn_if_unvalidated,
+        redshift_rate=config.redshift_rate,
         redshift_evolution=evolution,
+    )
+
+
+def _parse_redshift_rate(section: Any) -> RedshiftRateConfig:
+    if not section:
+        return RedshiftRateConfig()
+    model = _get_str(section, "model", "power_law")
+    power_law_index = _get_value_or_column(section, "power_law_index", "lamb")
+    madau_alpha = _get_optional_value_or_column(section, "madau_alpha", "alpha")
+    madau_beta = _get_optional_value_or_column(section, "madau_beta", "beta")
+    madau_z_peak = _get_optional_value_or_column(section, "madau_z_peak", "z_peak")
+    return RedshiftRateConfig(
+        model=model,
+        power_law_index=power_law_index,
+        madau_alpha=madau_alpha,
+        madau_beta=madau_beta,
+        madau_z_peak=madau_z_peak,
     )
 
 
@@ -259,3 +282,24 @@ def _get_bool(section: Any, name: str, default: bool) -> bool:
     if value in {"0", "false", "no", "n", "off"}:
         return False
     raise ValueError(f"Cannot parse boolean value for {name!r}: {section[name]!r}")
+
+
+def _get_value_or_column(section: Any, name: str, default: str | float) -> str | float:
+    if name not in section:
+        return default
+    value = str(section[name]).strip()
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _get_optional_value_or_column(section: Any, *names: str) -> str | float | None:
+    for name in names:
+        if name in section:
+            value = str(section[name]).strip()
+            try:
+                return float(value)
+            except ValueError:
+                return value
+    return None
