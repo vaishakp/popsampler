@@ -159,11 +159,15 @@ class NotchMassSampler:
             q[i] = InverseCDFSampler.from_pdf(q_grid, q_pdf).sample(1, rng)[0]
 
         m2 = q * m1
+        chirp = (m1 * m2) ** (3.0 / 5.0) / (m1 + m2) ** (1.0 / 5.0)
         return {
-            "mass_1": m1,
-            "mass_2": m2,
+            "mass_1_source": m1,
+            "mass_2_source": m2,
             "mass_ratio": q,
-            "mass_sampler_mode": np.full(n, "native_notch_object_spectrum_q_power_pairing", dtype=object),
+            "chirp_mass_source": chirp,
+            "total_mass_source": m1 + m2,
+            "mass_sampler_backend": np.full(n, "native_notch_object_spectrum_q_power_pairing", dtype=object),
+            "notch_mass_model": np.full(n, "three_segment_object_spectrum", dtype=object),
         }
 
     def _marginal_m1_pdf(
