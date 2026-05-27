@@ -21,9 +21,10 @@ Implemented in the `initial-gwtc4-sampler` branch:
 2. `popsampler-inspect`: inspect an HDF5 `popsummary` file and print available hyperparameter columns.
 3. `popsampler-sample-bbh`: draw source samples by drawing coherent hyperposterior rows and sampling a model conditional on each row.
 4. User-selectable mass models: `bpl2peak` and native `notch`.
-5. Optional redshift evolution: draw `z` first, evolve selected hyperparameters to `Λ(z)`, then draw masses/spins conditional on the evolved row.
+5. User-selectable redshift-rate models: `power_law` and `madau_dickinson`.
+6. Optional redshift evolution: draw `z` first, evolve selected hyperparameters to `Λ(z)`, then draw masses/spins conditional on the evolved row.
 
-The default sampler remains the GWTC-style block-factorized `bpl2peak` model. Redshift evolution and the Notch model are opt-in and must be explicitly requested.
+The default sampler remains the GWTC-style block-factorized `bpl2peak` model with a `power_law` redshift-rate model. Redshift evolution, the Notch model, and Madau-Dickinson redshift rates are opt-in and must be explicitly requested.
 
 ## Install
 
@@ -70,6 +71,42 @@ p(m1, q | Λ) ∝ p_obj(m1 | Λ) p_obj(q m1 | Λ) q**beta
 
 with ordered components `m1 >= m2`, `q = m2/m1`, and the same object-spectrum support applied to both components. `BHmax`/`bh_max`/`mmax` and `beta` are optional; if absent, `BHmax` is taken from the grid `m1_max`, and `beta = 0`.
 
+## User-selectable redshift-rate models
+
+The redshift source distribution is controlled separately from the mass model. The sampled PDF is always
+
+```text
+p(z | Λ) ∝ R(z | Λ) (dVc/dz) / (1 + z),
+```
+
+where the last factor is the source-frame to detector-frame time-dilation factor.
+
+Two rate models are available:
+
+```ini
+[redshift]
+model = power_law
+power_law_index = lamb
+```
+
+and
+
+```ini
+[redshift]
+model = madau_dickinson
+madau_alpha = 2.7
+madau_beta = 2.9
+madau_z_peak = 1.9
+```
+
+The Madau-Dickinson-like model is
+
+```text
+R(z) ∝ (1 + z)^alpha / {1 + [((1 + z)/(1 + z_peak))]^(alpha + beta)}.
+```
+
+At low redshift this grows approximately as `(1+z)^alpha`; at high redshift it falls approximately as `(1+z)^(-beta)`. The `madau_alpha`, `madau_beta`, and `madau_z_peak` values may be fixed numbers in the INI file or names of hyperposterior columns. If omitted, the sampler looks for common column aliases: `madau_alpha`/`md_alpha`/`alpha_z`/`gamma`, `madau_beta`/`md_beta`/`beta_z`/`kappa`, and `madau_z_peak`/`md_z_peak`/`z_peak`/`zp`/`z_p`.
+
 ## INI-style configuration
 
 Instead of passing all options on the command line, create an INI file:
@@ -96,6 +133,12 @@ mass_grid_size = 1200
 q_grid_size = 500
 z_grid_size = 4096
 spin_grid_size = 2048
+
+[redshift]
+model = madau_dickinson
+madau_alpha = 2.7
+madau_beta = 2.9
+madau_z_peak = 1.9
 
 [redshift_evolution]
 enabled = false
@@ -164,4 +207,4 @@ For publication-grade use, the evolution coefficients should correspond to an ac
 
 ## Important caveat
 
-The default BBH and native Notch samplers are initial implementations and should be validated against the LVK figure scripts/rate grids before being used for publication-grade posterior predictive samples. The downloader and inspector are intended to make that validation explicit rather than hiding assumptions.
+The default BBH, native Notch, and Madau-Dickinson redshift samplers are initial implementations and should be validated against the LVK figure scripts/rate grids before being used for publication-grade posterior predictive samples. The downloader and inspector are intended to make that validation explicit rather than hiding assumptions.
