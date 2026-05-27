@@ -23,6 +23,7 @@ import pandas as pd
 from .cosmology import DEFAULT_COSMOLOGY, luminosity_distance_from_redshift, power_law_redshift_pdf
 from .extrinsics import sample_isotropic_extrinsics
 from .gwpopulation_mass import GWPopulationMassSampler, GWPopulationMassSamplerConfig
+from .redshift_evolution import RedshiftEvolutionConfig
 from .samplers import InverseCDFSampler
 
 
@@ -63,6 +64,7 @@ class BBHDefaultModelConfig:
     spin_grid_size: int = 2048
     cosmology: object = field(default_factory=lambda: DEFAULT_COSMOLOGY)
     warn_if_unvalidated: bool = True
+    redshift_evolution: RedshiftEvolutionConfig = field(default_factory=RedshiftEvolutionConfig.disabled)
 
 
 class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
@@ -74,6 +76,12 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
     ``sigma_chi``; each binary draws a single formation channel with probability
     ``xi_spin``. In the Gaussian channel both cos-tilts are truncated Gaussians on
     ``[-1, 1]`` with ``mu_spin`` and ``sigma_spin``; otherwise they are isotropic.
+
+    Optional redshift evolution is applied only when
+    ``config.redshift_evolution.active`` is true. In that mode the sampler draws
+    event redshifts first, evolves selected hyperparameters to each event's
+    redshift, and then samples masses/spins conditional on those evolved values.
+    The default GWTC-style behavior is unchanged.
     """
 
     name = "BBHMassSpinRedshift_BrokenPowerLawTwoPeaks_GaussianComponentSpins_PowerLawRedshift"
@@ -113,13 +121,20 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
         )
         self._warned = False
 
+    @property
+    def redshift_evolution(self) -> RedshiftEvolutionConfig:
+        return self.config.redshift_evolution
+
     def validate_hyperparameters(self, row: Mapping[str, float]) -> None:
         missing = [name for name in self.REQUIRED_PARAMETERS if name not in row or pd.isna(row[name])]
         if missing:
             raise ModelValidationError(f"Missing required hyperparameters: {missing}")
         for name in self.REQUIRED_PARAMETERS:
             _required(row, name)
+        self._validate_physical_constraints(row)
+        self.redshift_evolution.validate(row)
 
+    def _validate_physical_constraints(self, row: Mapping[str, float]) -> None:
         if not (0 < _required(row, "mlow_1") < _required(row, "mmax")):
             raise ModelValidationError("Expected 0 < mlow_1 < mmax")
         if not (0 < _required(row, "mlow_2") < _required(row, "mmax")):
@@ -155,6 +170,14 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
             )
             self._warned = True
 
+        if self.redshift_evolution.active:
+            return self._sample_with_redshift_evolution(
+                hyper_row,
+                n,
+                rng=rng,
+                include_extrinsics=include_extrinsics,
+            )
+
         out: dict[str, np.ndarray] = {}
         out.update(self.sample_masses(hyper_row, n, rng=rng))
         out.update(self.sample_redshift(hyper_row, n, rng=rng))
@@ -162,11 +185,52 @@ class GWTC4BrokenPowerLawTwoPeaksGaussianComponentSpinsPowerLawRedshift:
         if include_extrinsics:
             out.update(sample_isotropic_extrinsics(n, rng=rng))
         df = pd.DataFrame(out)
+        self._annotate_dataframe(df, redshift_evolution_applied=False)
+        return df
+
+    def _sample_with_redshift_evolution(
+        self,
+        hyper_row: Mapping[str, float],
+        n: int,
+        *,
+        rng: np.random.Generator,
+        include_extrinsics: bool,
+    ) -> pd.DataFrame:
+        """Draw samples from p(z | Lambda) p(mass, spin | Lambda(z))."""
+        z_block = self.sample_redshift(hyper_row, n, rng=rng)
+        pieces: list[pd.DataFrame] = []
+        for i, z in enumerate(z_block["redshift"]):
+            evolved_row = self.redshift_evolution.evolve_row(hyper_row, float(z))
+            # Evolution can push parameters outside their physical support; catch
+            # that per event rather than silently clipping everything.
+            self._validate_physical_constraints(evolved_row)
+            out: dict[str, np.ndarray] = {
+                "redshift": np.asarray([z], dtype=float),
+                "luminosity_distance": np.asarray([z_block["luminosity_distance"][i]], dtype=float),
+            }
+            out.update(self.sample_masses(evolved_row, 1, rng=rng))
+            out.update(self.sample_spins(evolved_row, 1, rng=rng))
+            pieces.append(pd.DataFrame(out))
+
+        df = pd.concat(pieces, ignore_index=True)
+        if include_extrinsics:
+            extrinsics = sample_isotropic_extrinsics(n, rng=rng)
+            for key, value in extrinsics.items():
+                df[key] = value
+        self._annotate_dataframe(df, redshift_evolution_applied=True)
+        return df
+
+    def _annotate_dataframe(self, df: pd.DataFrame, *, redshift_evolution_applied: bool) -> None:
         df["model_name"] = self.name
-        df["sampler_mode"] = "gwtc4_named_joint_model"
+        df["sampler_mode"] = (
+            "gwtc4_named_joint_model_redshift_evolved"
+            if redshift_evolution_applied
+            else "gwtc4_named_joint_model"
+        )
         df["preserves_joint_covariance"] = True
         df["joint_sampler_validation_status"] = "requires_rates_on_grids_validation"
-        return df
+        df["redshift_evolution_applied"] = bool(redshift_evolution_applied)
+        df["redshift_evolution_spec"] = self.redshift_evolution.describe()
 
     def sample_masses(
         self,
