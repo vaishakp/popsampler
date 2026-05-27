@@ -1,4 +1,4 @@
-"""Draw GWTC-4.0-style BBH posterior-predictive samples."""
+"""Draw BBH posterior-predictive samples from a popsummary file."""
 
 from __future__ import annotations
 
@@ -7,13 +7,11 @@ from pathlib import Path
 
 import numpy as np
 
-from popsampler.models import (
-    BBHDefaultModelConfig,
-    BrokenPowerLawTwoPeaksGaussianSpinsPowerLawRedshift,
-)
+from popsampler.config import merge_cli_config, read_sampler_config, require_complete_run_config
+from popsampler.model_registry import available_models, get_bbh_model
 from popsampler.popsummary_io import get_hyperparameter_samples
 from popsampler.posterior_predictive import PosteriorPredictiveSampler
-from popsampler.redshift_evolution import ParameterEvolution, RedshiftEvolutionConfig
+from popsampler.redshift_evolution import ParameterEvolution
 
 
 def write_table(df, output: Path) -> None:
@@ -67,11 +65,13 @@ def parse_evolution_spec(spec: str) -> ParameterEvolution:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("popsummary_file", help="GWTC-4.0 popsummary HDF5 file")
-    parser.add_argument("--n-events", type=int, required=True, help="Number of source events to draw")
-    parser.add_argument("--output", required=True, help="Output .csv, .parquet, or .h5 file")
+    parser.add_argument("popsummary_file", nargs="?", help="Popsummary HDF5 file")
+    parser.add_argument("--config", help="INI-style sampler configuration file")
+    parser.add_argument("--model", choices=available_models(), help="Mass model to use")
+    parser.add_argument("--n-events", type=int, help="Number of source events to draw")
+    parser.add_argument("--output", help="Output .csv, .parquet, or .h5 file")
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=1, help="Events per hyperposterior row")
+    parser.add_argument("--batch-size", type=int, default=None, help="Events per hyperposterior row")
     parser.add_argument("--no-extrinsics", action="store_true")
     parser.add_argument(
         "--redshift-evolve",
@@ -87,33 +87,42 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--redshift-evolution-reference-z",
         type=float,
-        default=0.0,
+        default=None,
         help="Reference redshift z_ref for --redshift-evolve specs.",
     )
     args = parser.parse_args(argv)
 
-    rng = np.random.default_rng(args.seed)
-    hyper = get_hyperparameter_samples(args.popsummary_file)
+    file_config = read_sampler_config(args.config) if args.config else None
     evolutions = tuple(parse_evolution_spec(spec) for spec in args.redshift_evolve)
-    evolution_config = RedshiftEvolutionConfig(
-        enabled=bool(evolutions),
-        parameter_evolutions=evolutions,
-        reference_redshift=args.redshift_evolution_reference_z,
+    run_config = merge_cli_config(
+        file_config,
+        popsummary_file=args.popsummary_file,
+        output=args.output,
+        n_events=args.n_events,
+        seed=args.seed,
+        batch_size=args.batch_size,
+        include_extrinsics=False if args.no_extrinsics else None,
+        model=args.model,
+        redshift_evolutions=evolutions,
+        redshift_evolution_reference_z=args.redshift_evolution_reference_z,
     )
-    model = BrokenPowerLawTwoPeaksGaussianSpinsPowerLawRedshift(
-        BBHDefaultModelConfig(redshift_evolution=evolution_config)
-    )
+    require_complete_run_config(run_config)
+
+    rng = np.random.default_rng(run_config.seed)
+    hyper = get_hyperparameter_samples(run_config.popsummary_file)  # type: ignore[arg-type]
+    model = get_bbh_model(run_config.model, run_config.model_config)
     sampler = PosteriorPredictiveSampler(hyperposterior=hyper, model=model)
     samples = sampler.sample(
-        args.n_events,
+        run_config.n_events,  # type: ignore[arg-type]
         rng=rng,
-        batch_size=args.batch_size,
-        include_extrinsics=not args.no_extrinsics,
+        batch_size=run_config.batch_size,
+        include_extrinsics=run_config.include_extrinsics,
     )
-    write_table(samples, Path(args.output))
-    print(f"wrote {len(samples)} samples to {args.output}")
-    if evolution_config.active:
-        print(f"redshift_evolution: {evolution_config.describe()}")
+    write_table(samples, Path(run_config.output))  # type: ignore[arg-type]
+    print(f"wrote {len(samples)} samples to {run_config.output}")
+    print(f"model: {run_config.model}")
+    if run_config.model_config.redshift_evolution.active:
+        print(f"redshift_evolution: {run_config.model_config.redshift_evolution.describe()}")
 
 
 if __name__ == "__main__":
