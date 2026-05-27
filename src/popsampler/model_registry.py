@@ -43,7 +43,6 @@ class GWTC4NotchMassGaussianComponentSpinsPowerLawRedshift(
         "mu_spin",
         "sigma_spin",
         "xi_spin",
-        "lamb",
     )
 
     def __init__(self, config: BBHDefaultModelConfig | None = None):
@@ -67,6 +66,7 @@ class GWTC4NotchMassGaussianComponentSpinsPowerLawRedshift(
         for name in self.REQUIRED_PARAMETERS:
             _required_value(row, name)
         self._validate_physical_constraints(row)
+        self.redshift_rate.validate(row)
         self.redshift_evolution.validate(row)
 
     def _validate_physical_constraints(self, row: Mapping[str, float]) -> None:
