@@ -7,7 +7,10 @@ from pathlib import Path
 
 import numpy as np
 
-from popsampler.models import BBHDefaultModelConfig, BrokenPowerLawTwoPeaksGaussianSpinsPowerLawRedshift
+from popsampler.models import (
+    BBHDefaultModelConfig,
+    BrokenPowerLawTwoPeaksGaussianSpinsPowerLawRedshift,
+)
 from popsampler.popsummary_io import get_hyperparameter_samples
 from popsampler.posterior_predictive import PosteriorPredictiveSampler
 from popsampler.redshift_evolution import ParameterEvolution, RedshiftEvolutionConfig
